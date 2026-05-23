@@ -1,0 +1,43 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# vim swap file
+**/*.swp
+
+# go dependencies at runtime
+vendor/**
+
+# test log
+**/test.log
+
+# bak files
+**/*.bak
+
+# mockgen generated or related files
+.mockgen_files_generated
+.mockgen_installed
+
+# local environment files
+**/.env
+
+# docker compose override files
+**/docker-compose.override.yml
+**/docker-compose.override.yaml
+
+# vscode file
+launch.json
+settings.json
+**/__debug_bin*
+drivers/cmd/hd-driver-vault/hd-driver-*
+kubernetes
+drivers/cmd/auth-gcp-iap/auth-gcp-iap
