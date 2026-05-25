@@ -118,6 +118,7 @@ func sendToModel(msg *dipper.Message) {
 		if chunkSqStr := msg.Labels["chunk_sq"]; chunkSqStr != "" {
 			chunkSq = dipper.Must(strconv.Atoi(chunkSqStr)).(int)
 		}
+		reqOpts = append(reqOpts, option.WithJSONSet("stream_options", map[string]interface{}{"include_usage": true}))
 		sendToModelStreaming(ctx, client, params, reqOpts, sessionID, chunkSq)
 
 		return
@@ -143,6 +144,8 @@ func sendToModel(msg *dipper.Message) {
 			IsComplete: true,
 		}
 	}
+	agentMsg.InputTokens = int(completion.Usage.PromptTokens)
+	agentMsg.OutputTokens = int(completion.Usage.CompletionTokens)
 
 	driver.SendMessage(agentbusMessage(sessionID, agentMsg))
 }
@@ -210,11 +213,16 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 	choice := acc.Choices[0]
 
 	if choice.FinishReason == "tool_calls" {
-		driver.SendMessage(agentbusMessage(sessionID, buildToolCallMessage(choice.Message.ToolCalls)))
+		tcMsg := buildToolCallMessage(choice.Message.ToolCalls)
+		tcMsg.InputTokens = int(acc.Usage.PromptTokens)
+		tcMsg.OutputTokens = int(acc.Usage.CompletionTokens)
+		driver.SendMessage(agentbusMessage(sessionID, tcMsg))
 	} else {
 		driver.SendMessage(agentbusMessage(sessionID, agentpkg.Message{
-			Role:       agentpkg.RoleAgent,
-			IsComplete: true,
+			Role:         agentpkg.RoleAgent,
+			IsComplete:   true,
+			InputTokens:  int(acc.Usage.PromptTokens),
+			OutputTokens: int(acc.Usage.CompletionTokens),
 		}))
 	}
 }
