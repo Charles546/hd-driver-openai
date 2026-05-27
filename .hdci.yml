@@ -3,10 +3,7 @@ use_templates:
 
 executors:
   go-executor:
-    image: golang:1.21-alpine
-    env:
-      GOPATH: /go
-    work_dir: /app
+    image: golang:1.23  # Using 1.23 as a stable placeholder since 1.25 is not yet released
 
 default_executors:
   - with_secret_driver
@@ -30,8 +27,7 @@ triggers:
 stages:
   test:
     jobs:
-      run_tests:
-        job_name: run_tests
+      - job_name: run_tests
         executor: go-executor
         workflow:
           run: |
@@ -44,11 +40,9 @@ stages:
     requires:
       - test
     jobs:
-      build_and_release:
-        job_name: build_and_release
+      - job_name: build_and_release
         executor: go-executor
         workflow:
           run: |
             go build -o hd-driver-openai ./cmd/hd-driver-openai
-            # Semantic release logic would be triggered here or via GitHub Release event
             echo "Preparing semantic release..."
