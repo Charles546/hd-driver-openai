@@ -2,10 +2,11 @@ use_templates:
   - hdci.tmpl.yml
 
 executors:
-  sh-c:
-    command_++:
-      - /bin/sh
-      - -c
+  go-executor:
+    image: golang:1.21-alpine
+    env:
+      GOPATH: /go
+    work_dir: /app
 
 default_executors:
   - with_secret_driver
@@ -30,11 +31,11 @@ stages:
   test:
     jobs:
       run_tests:
-        script_ref:
-          steps:
-            - with_run:
-                run: |
-                  go test -v ./...
+        job_name: run_tests
+        executor: go-executor
+        workflow:
+          run: |
+            go test -v ./...
     gh_status_message:
       success: "OpenAI driver tests passed!"
       error: "OpenAI driver tests failed."
@@ -43,13 +44,11 @@ stages:
     requires:
       - test
     jobs:
-      build_and_publish:
-        script_ref:
-          steps:
-            - with_run:
-                run: |
-                  go build -o hd-driver-openai ./cmd/hd-driver-openai
-                  echo "Driver built and ready for publishing step."
-    gh_status_message:
-      success: "OpenAI driver published successfully!"
-      error: "OpenAI driver publishing failed."
+      build_and_release:
+        job_name: build_and_release
+        executor: go-executor
+        workflow:
+          run: |
+            go build -o hd-driver-openai ./cmd/hd-driver-openai
+            # Semantic release logic would be triggered here or via GitHub Release event
+            echo "Preparing semantic release..."
