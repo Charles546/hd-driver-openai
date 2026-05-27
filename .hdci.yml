@@ -1,24 +1,55 @@
 use_templates:
   - hdci.tmpl.yml
+
 executors:
   sh-c:
-    command_++: ["/bin/sh", "-c"]
-default_executors: ["with_secret_driver", "sh-c"]
-default_script_steps: ["load_secret_driver", "github_checkout"]
+    command_++:
+      - /bin/sh
+      - -c
+
+default_executors:
+  - with_secret_driver
+  - sh-c
+
+default_script_steps:
+  - load_secret_driver
+  - github_checkout
+
 triggers:
-  - conditions: { gh_event: push }
-    stages: [test]
-  - conditions: { gh_event: release }
-    stages: [test, publish]
+  - conditions:
+      gh_event: push
+    stages:
+      - test
+  - conditions:
+      gh_event: release
+    stages:
+      - test
+      - publish
+
 stages:
   test:
     jobs:
       run_tests:
         script_ref:
-          steps: ["load_secret_driver", "github_checkout", {with_run: {run: "go test -v ./..."}}]
+          steps:
+            - with_run:
+                run: |
+                  go test -v ./...
+    gh_status_message:
+      success: "OpenAI driver tests passed!"
+      error: "OpenAI driver tests failed."
+
   publish:
-    requires: [test]
+    requires:
+      - test
     jobs:
       build_and_publish:
         script_ref:
-          steps: ["load_secret_driver", "github_checkout", {with_run: {run: "go build -o hd-driver-openai ./cmd/hd-driver-openai"}}]
+          steps:
+            - with_run:
+                run: |
+                  go build -o hd-driver-openai ./cmd/hd-driver-openai
+                  echo "Driver built and ready for publishing step."
+    gh_status_message:
+      success: "OpenAI driver published successfully!"
+      error: "OpenAI driver publishing failed."
