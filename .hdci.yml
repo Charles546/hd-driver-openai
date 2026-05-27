@@ -1,9 +1,12 @@
 use_templates:
-  - hdci.tmpl.yml
+  - https://github.com/Charles546/hd-driver-podman/blob/main/hdci.tmpl.yml
 
 executors:
   go-executor:
-    image: golang:1.23  # Using 1.23 as a stable placeholder since 1.25 is not yet released
+    image: golang:1.23
+    cache:
+      - path: /go/pkg/mod
+      - path: /root/.cache/go-build
 
 default_executors:
   - with_secret_driver
