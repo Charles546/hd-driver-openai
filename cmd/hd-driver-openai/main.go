@@ -14,7 +14,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"strconv"
 
 	agentpkg "github.com/honeydipper/honeydipper/v4/pkg/agent"
 	"github.com/honeydipper/honeydipper/v4/pkg/dipper"
@@ -114,12 +113,8 @@ func sendToModel(msg *dipper.Message) {
 
 	shouldStream, _ := dipper.GetMapDataBool(msg.Payload, "should_stream")
 	if shouldStream {
-		chunkSq := 0
-		if chunkSqStr := msg.Labels["chunk_sq"]; chunkSqStr != "" {
-			chunkSq = dipper.Must(strconv.Atoi(chunkSqStr)).(int)
-		}
 		reqOpts = append(reqOpts, option.WithJSONSet("stream_options", map[string]interface{}{"include_usage": true}))
-		sendToModelStreaming(ctx, client, params, reqOpts, sessionID, chunkSq)
+		sendToModelStreaming(ctx, client, params, reqOpts, sessionID)
 
 		return
 	}
@@ -167,7 +162,9 @@ func agentbusMessage(sessionID string, msg agentpkg.Message) *dipper.Message {
 // delta as a non-complete agentbus message, and sends a final complete message
 // once the stream closes.  Tool-call responses are accumulated and sent as a
 // single tool message at the end.
-func sendToModelStreaming(ctx context.Context, client *openai.Client, params openai.ChatCompletionNewParams, reqOpts []option.RequestOption, sessionID string, chunkSq int) {
+func sendToModelStreaming(ctx context.Context, client *openai.Client, params openai.ChatCompletionNewParams,
+	reqOpts []option.RequestOption, sessionID string,
+) {
 	streamer := client.Chat.Completions.NewStreaming(ctx, params, reqOpts...)
 	acc := openai.ChatCompletionAccumulator{}
 

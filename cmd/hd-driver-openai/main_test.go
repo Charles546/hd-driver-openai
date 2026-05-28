@@ -25,7 +25,7 @@ import (
 func TestMain(m *testing.M) {
 	if dipper.Logger == nil {
 		f, _ := os.Create("test.log")
-		defer f.Close() //nolint:errcheck
+		defer f.Close()
 		dipper.GetLogger("test service", "DEBUG", f, f)
 	}
 	os.Exit(m.Run())
@@ -276,7 +276,7 @@ func TestSendToModel_TextResponse(t *testing.T) {
 	defer ts.Close()
 
 	outReader, outWriter := setupDriverWithServer(ts)
-	defer outWriter.Close() //nolint:errcheck
+	defer outWriter.Close()
 
 	done := make(chan *dipper.Message, 1)
 	go func() { done <- dipper.FetchMessage(outReader) }()
@@ -303,7 +303,7 @@ func TestSendToModel_ToolCallResponse(t *testing.T) {
 	defer ts.Close()
 
 	outReader, outWriter := setupDriverWithServer(ts)
-	defer outWriter.Close() //nolint:errcheck
+	defer outWriter.Close()
 
 	done := make(chan *dipper.Message, 1)
 	go func() { done <- dipper.FetchMessage(outReader) }()
@@ -352,10 +352,10 @@ func mockSSEServer(chunks []map[string]interface{}) *httptest.Server {
 
 		for _, chunk := range chunks {
 			b, _ := json.Marshal(chunk)
-			fmt.Fprintf(w, "data: %s\n\n", b) //nolint:errcheck
+			fmt.Fprintf(w, "data: %s\n\n", b)
 		}
 
-		fmt.Fprint(w, "data: [DONE]\n\n") //nolint:errcheck
+		fmt.Fprint(w, "data: [DONE]\n\n")
 
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
@@ -425,7 +425,7 @@ func TestSendToModel_StreamingTextResponse(t *testing.T) {
 	defer ts.Close()
 
 	outReader, outWriter := setupStreamingDriverWithServer(ts)
-	defer outWriter.Close() //nolint:errcheck
+	defer outWriter.Close()
 
 	// Collect all messages until the writer is closed.  FetchMessage panics on EOF
 	// so we recover to detect the end of stream.
@@ -469,7 +469,7 @@ func TestSendToModel_StreamingTextResponse(t *testing.T) {
 		},
 	})
 
-	outWriter.Close() //nolint:errcheck
+	outWriter.Close()
 	<-done
 
 	require.GreaterOrEqual(t, len(msgs), 2, "expected at least one chunk and one final message")
@@ -498,7 +498,7 @@ func TestSendToModel_StreamingToolCallResponse(t *testing.T) {
 	defer ts.Close()
 
 	outReader, outWriter := setupStreamingDriverWithServer(ts)
-	defer outWriter.Close() //nolint:errcheck
+	defer outWriter.Close()
 
 	done := make(chan *dipper.Message, 1)
 	go func() { done <- dipper.FetchMessage(outReader) }()

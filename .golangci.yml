@@ -1,0 +1,88 @@
+version: "2"
+linters:
+  enable:
+    - asciicheck
+    - bodyclose
+    - copyloopvar
+    - dogsled
+    - dupl
+    - err113
+    - errorlint
+    - funlen
+    - gochecknoinits
+    - gocognit
+    # - goconst
+    - gocritic
+    - gocyclo
+    - godot
+    - godox
+    - goheader
+    - gomodguard
+    - goprintffuncname
+    - gosec
+    - lll
+    - misspell
+    - nakedret
+    - nestif
+    - nlreturn
+    - noctx
+    - nolintlint
+    - paralleltest
+    - prealloc
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - testpackage
+    - tparallel
+    - unconvert
+    - unparam
+    - whitespace
+    - wrapcheck
+  settings:
+    funlen:
+      lines: 120
+      statements: 80
+    gocognit:
+      min-complexity: 60
+    gosec:
+      excludes:
+        - G115
+    lll:
+      line-length: 142
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - dupl
+          - err113
+          - errcheck
+          - funlen
+          - gocritic
+          - gosec
+          - lll
+          - nestif
+          - paralleltest
+          - staticcheck
+          - testpackage
+        path: _test\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
