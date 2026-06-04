@@ -309,31 +309,20 @@ func buildTools(tools map[string]agentpkg.Tool) []openai.ChatCompletionToolUnion
 	result := make([]openai.ChatCompletionToolUnionParam, 0, len(tools))
 
 	for _, tool := range tools {
-		properties := make(map[string]interface{}, len(tool.Params))
 		required := make([]string, 0, len(tool.Params))
 
 		for paramName, paramDef := range tool.Params {
-			def, ok := paramDef.(map[string]interface{})
+			_, ok := paramDef.(map[string]interface{})
 			if !ok {
 				continue
 			}
 
-			prop := map[string]interface{}{"type": "string"}
-			if t, ok := def["type"].(string); ok && t != "" {
-				prop["type"] = t
-			}
-
-			if d, ok := def["description"]; ok {
-				prop["description"] = d
-			}
-
-			properties[paramName] = prop
 			required = append(required, paramName)
 		}
 
 		parameters := openai.FunctionParameters{
 			"type":       "object",
-			"properties": properties,
+			"properties": tool.Params,
 		}
 		if len(required) > 0 {
 			parameters["required"] = required
