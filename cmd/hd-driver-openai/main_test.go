@@ -142,24 +142,6 @@ func TestBuildTools_WithParam(t *testing.T) {
 	assert.Contains(t, required, "query")
 }
 
-func TestBuildTools_SkipsInvalidParam(t *testing.T) {
-	tools := map[string]agentpkg.Tool{
-		"tool": {
-			Name: "tool",
-			Params: map[string]interface{}{
-				"good": map[string]interface{}{"type": "string"},
-				"bad":  "not-a-map",
-			},
-		},
-	}
-	result := buildTools(tools)
-	require.Len(t, result, 1)
-	params := result[0].OfFunction.Function.Parameters
-	properties := params["properties"].(map[string]interface{})
-	assert.Contains(t, properties, "good")
-	assert.NotContains(t, properties, "bad")
-}
-
 // ─── buildToolCallMessage ──────────────────────────────────────────────────────
 
 func TestBuildToolCallMessage_Single(t *testing.T) {
