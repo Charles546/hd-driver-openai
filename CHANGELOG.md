@@ -1,3 +1,10 @@
+## [1.0.1](https://github.com/Charles546/hd-driver-openai/compare/v1.0.0...v1.0.1) (2026-06-04)
+
+
+### Bug Fixes
+
+* avoid losing tool parameter defs ([#3](https://github.com/Charles546/hd-driver-openai/issues/3)) ([39c4d78](https://github.com/Charles546/hd-driver-openai/commit/39c4d78a23ccebce0eae5c23c20d782441695de9))
+
 # 1.0.0 (2026-05-28)
 
 
