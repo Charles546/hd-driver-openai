@@ -84,26 +84,23 @@ func sendToModel(msg *dipper.Message) {
 		dipper.Must(mapstructure.Decode(toolsRaw, &tools))
 	}
 
+	// Build the OpenAI request.
+	params := openai.ChatCompletionNewParams{}
 	modelDataRaw, _ := dipper.GetMapData(msg.Payload, "model_data")
-	var modelData map[string]interface{}
 	if modelDataRaw != nil {
-		_ = mapstructure.Decode(modelDataRaw, &modelData)
+		jstring := dipper.Must(json.Marshal(modelDataRaw)).([]byte)
+		dipper.Must(json.Unmarshal(jstring, &params))
+		dipper.Logger.Infof("[openai] send_to_model using model_data params session=%s: %+v", sessionID, params)
 	}
 
-	// Build the OpenAI request.
-	params := openai.ChatCompletionNewParams{
-		Model:    cfg.Model,
-		Messages: buildMessages(history),
-	}
+	params.Model = cfg.Model
+	params.Messages = buildMessages(history)
 	if openaiTools := buildTools(tools); len(openaiTools) > 0 {
 		params.Tools = openaiTools
 	}
 
-	// Per-request overrides from model_data (e.g. temperature, max_tokens).
-	reqOpts := make([]option.RequestOption, 0, len(modelData))
-	for k, v := range modelData {
-		reqOpts = append(reqOpts, option.WithJSONSet(k, v))
-	}
+	// Per-request options
+	reqOpts := []option.RequestOption{}
 
 	// Obtain a context that is cancelled when the driver shuts down.
 	ctx, cancel := driver.GetContext(msg)
