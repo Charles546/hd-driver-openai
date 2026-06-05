@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/Charles546/hd-driver-openai/compare/v1.0.1...v1.1.0) (2026-06-05)
+
+
+### Features
+
+* setting reasoning effort temperature using model_data ([#4](https://github.com/Charles546/hd-driver-openai/issues/4)) ([2397961](https://github.com/Charles546/hd-driver-openai/commit/2397961b526115597608ec4489bc1431b4b3d63a))
+
 ## [1.0.1](https://github.com/Charles546/hd-driver-openai/compare/v1.0.0...v1.0.1) (2026-06-04)
 
 
