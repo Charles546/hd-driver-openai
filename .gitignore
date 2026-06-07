@@ -41,4 +41,4 @@ settings.json
 drivers/cmd/hd-driver-vault/hd-driver-*
 kubernetes
 drivers/cmd/auth-gcp-iap/auth-gcp-iap
-hd-driver-openai
+./hd-driver-openai

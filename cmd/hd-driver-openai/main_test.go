@@ -34,8 +34,8 @@ func TestMain(m *testing.M) {
 // ─── buildMessages ────────────────────────────────────────────────────────────
 
 func TestBuildMessages_Empty(t *testing.T) {
-	assert.Empty(t, buildMessages(nil))
-	assert.Empty(t, buildMessages([]agentpkg.Message{}))
+	assert.Empty(t, buildMessages(nil, ""))
+	assert.Empty(t, buildMessages([]agentpkg.Message{}, ""))
 }
 
 func TestBuildMessages_SystemAndUser(t *testing.T) {
@@ -43,7 +43,7 @@ func TestBuildMessages_SystemAndUser(t *testing.T) {
 		{Role: agentpkg.RoleSystem, Content: "You are helpful."},
 		{Role: agentpkg.RoleUser, Content: "Hello!"},
 	}
-	msgs := buildMessages(history)
+	msgs := buildMessages(history, "")
 	require.Len(t, msgs, 2)
 	assert.NotNil(t, msgs[0].OfSystem)
 	assert.NotNil(t, msgs[1].OfUser)
@@ -53,16 +53,18 @@ func TestBuildMessages_AgentMessage(t *testing.T) {
 	history := []agentpkg.Message{
 		{Role: agentpkg.RoleAgent, Content: "Hi there!"},
 	}
-	msgs := buildMessages(history)
+	msgs := buildMessages(history, "")
 	require.Len(t, msgs, 1)
 	assert.NotNil(t, msgs[0].OfAssistant)
 	assert.Nil(t, msgs[0].OfAssistant.ToolCalls)
 }
 
 func TestBuildMessages_ToolRoundTrip(t *testing.T) {
+	// Under the new protocol, tool calls are stored in RoleAgent messages.
 	history := []agentpkg.Message{
 		{
-			Role: agentpkg.RoleTool,
+			Role:       agentpkg.RoleAgent,
+			IsComplete: true,
 			ToolCalls: []agentpkg.ToolCall{
 				{FuncName: "my_func", Params: map[string]interface{}{"arg": "val"}},
 			},
@@ -72,7 +74,7 @@ func TestBuildMessages_ToolRoundTrip(t *testing.T) {
 			ToolResult: []map[string]interface{}{{"result": "ok"}},
 		},
 	}
-	msgs := buildMessages(history)
+	msgs := buildMessages(history, "")
 	// assistant message with tool_calls + 1 tool result
 	require.Len(t, msgs, 2)
 	require.NotNil(t, msgs[0].OfAssistant)
@@ -84,9 +86,11 @@ func TestBuildMessages_ToolRoundTrip(t *testing.T) {
 }
 
 func TestBuildMessages_MultipleToolResults(t *testing.T) {
+	// Under the new protocol, tool calls are stored in RoleAgent messages.
 	history := []agentpkg.Message{
 		{
-			Role: agentpkg.RoleTool,
+			Role:       agentpkg.RoleAgent,
+			IsComplete: true,
 			ToolCalls: []agentpkg.ToolCall{
 				{FuncName: "fn1", Params: map[string]interface{}{}},
 				{FuncName: "fn2", Params: map[string]interface{}{}},
@@ -100,13 +104,30 @@ func TestBuildMessages_MultipleToolResults(t *testing.T) {
 			},
 		},
 	}
-	msgs := buildMessages(history)
+	msgs := buildMessages(history, "")
 	// 1 assistant with 2 tool calls + 2 tool result messages
 	require.Len(t, msgs, 3)
 	assert.NotNil(t, msgs[0].OfAssistant)
 	assert.Len(t, msgs[0].OfAssistant.ToolCalls, 2)
 	assert.NotNil(t, msgs[1].OfTool)
 	assert.NotNil(t, msgs[2].OfTool)
+}
+
+func TestBuildMessages_ReasoningInjection(t *testing.T) {
+	history := []agentpkg.Message{
+		{Role: agentpkg.RoleAgent, Content: "I think first.", Thoughts: "internal reasoning"},
+	}
+	// Without injection field: extra fields should not be set.
+	msgs := buildMessages(history, "")
+	require.Len(t, msgs, 1)
+	require.NotNil(t, msgs[0].OfAssistant)
+	assert.Empty(t, msgs[0].OfAssistant.ExtraFields())
+
+	// With injection field: Thoughts should appear in extra fields.
+	msgs = buildMessages(history, "reasoning")
+	require.Len(t, msgs, 1)
+	require.NotNil(t, msgs[0].OfAssistant)
+	assert.Contains(t, msgs[0].OfAssistant.ExtraFields(), "reasoning")
 }
 
 // ─── buildTools ───────────────────────────────────────────────────────────────
@@ -142,9 +163,9 @@ func TestBuildTools_WithParam(t *testing.T) {
 	assert.Contains(t, required, "query")
 }
 
-// ─── buildToolCallMessage ──────────────────────────────────────────────────────
+// ─── buildToolCalls ──────────────────────────────────────────────────────────
 
-func TestBuildToolCallMessage_Single(t *testing.T) {
+func TestBuildToolCalls_Single(t *testing.T) {
 	toolCalls := []openai.ChatCompletionMessageToolCallUnion{
 		{
 			Function: openai.ChatCompletionMessageFunctionToolCallFunction{
@@ -153,32 +174,31 @@ func TestBuildToolCallMessage_Single(t *testing.T) {
 			},
 		},
 	}
-	msg := buildToolCallMessage(toolCalls)
-	assert.Equal(t, agentpkg.RoleTool, msg.Role)
-	require.Len(t, msg.ToolCalls, 1)
-	assert.Equal(t, "do_thing", msg.ToolCalls[0].FuncName)
-	assert.Equal(t, float64(1), msg.ToolCalls[0].Params["x"])
+	calls := buildToolCalls(toolCalls)
+	require.Len(t, calls, 1)
+	assert.Equal(t, "do_thing", calls[0].FuncName)
+	assert.Equal(t, float64(1), calls[0].Params["x"])
 }
 
-func TestBuildToolCallMessage_Multiple(t *testing.T) {
+func TestBuildToolCalls_Multiple(t *testing.T) {
 	toolCalls := []openai.ChatCompletionMessageToolCallUnion{
 		{Function: openai.ChatCompletionMessageFunctionToolCallFunction{Name: "a", Arguments: `{"k":"v1"}`}},
 		{Function: openai.ChatCompletionMessageFunctionToolCallFunction{Name: "b", Arguments: `{"k":"v2"}`}},
 	}
-	msg := buildToolCallMessage(toolCalls)
-	require.Len(t, msg.ToolCalls, 2)
-	assert.Equal(t, "a", msg.ToolCalls[0].FuncName)
-	assert.Equal(t, "b", msg.ToolCalls[1].FuncName)
+	calls := buildToolCalls(toolCalls)
+	require.Len(t, calls, 2)
+	assert.Equal(t, "a", calls[0].FuncName)
+	assert.Equal(t, "b", calls[1].FuncName)
 }
 
-func TestBuildToolCallMessage_InvalidJSON(t *testing.T) {
+func TestBuildToolCalls_InvalidJSON(t *testing.T) {
 	toolCalls := []openai.ChatCompletionMessageToolCallUnion{
 		{Function: openai.ChatCompletionMessageFunctionToolCallFunction{Name: "fn", Arguments: `not-json`}},
 	}
-	msg := buildToolCallMessage(toolCalls)
-	require.Len(t, msg.ToolCalls, 1)
-	assert.Equal(t, "fn", msg.ToolCalls[0].FuncName)
-	assert.Nil(t, msg.ToolCalls[0].Params)
+	calls := buildToolCalls(toolCalls)
+	require.Len(t, calls, 1)
+	assert.Equal(t, "fn", calls[0].FuncName)
+	assert.Nil(t, calls[0].Params)
 }
 
 // ─── sendToModel integration ──────────────────────────────────────────────────
@@ -299,7 +319,8 @@ func TestSendToModel_ToolCallResponse(t *testing.T) {
 	require.True(t, ok)
 	msgMap, ok := payloadMap["message"].(map[string]interface{})
 	require.True(t, ok)
-	assert.Equal(t, agentpkg.RoleTool, msgMap["Role"])
+	assert.Equal(t, agentpkg.RoleAgent, msgMap["Role"])
+	assert.True(t, msgMap["is_complete"].(bool))
 
 	rawCalls, ok := msgMap["ToolCalls"].([]interface{})
 	require.True(t, ok)
@@ -504,7 +525,8 @@ func TestSendToModel_StreamingToolCallResponse(t *testing.T) {
 	msgMap, ok := payloadMap["message"].(map[string]interface{})
 	require.True(t, ok)
 
-	assert.Equal(t, agentpkg.RoleTool, msgMap["Role"])
+	assert.Equal(t, agentpkg.RoleAgent, msgMap["Role"])
+	assert.True(t, msgMap["is_complete"].(bool))
 
 	rawCalls, ok := msgMap["ToolCalls"].([]interface{})
 	require.True(t, ok)
