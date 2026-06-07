@@ -93,10 +93,19 @@ func sendToModel(msg *dipper.Message) {
 		dipper.Logger.Infof("[openai] send_to_model using model_data params session=%s: %+v", sessionID, params)
 	}
 
+	reasoningExtraction, _ := dipper.GetMapDataStr(msg.Payload, "agent_settings.reasoning.extraction_field")
+	reasoningInjection, _ := dipper.GetMapDataStr(msg.Payload, "agent_settings.reasoning.injection_field")
+
 	params.Model = cfg.Model
-	params.Messages = buildMessages(history)
+	params.Messages = buildMessages(history, reasoningInjection)
 	if openaiTools := buildTools(tools); len(openaiTools) > 0 {
 		params.Tools = openaiTools
+	}
+
+	if extraFields, _ := dipper.GetMapData(msg.Payload, "model_data.extra_fields"); extraFields != nil {
+		if m, ok := extraFields.(map[string]interface{}); ok {
+			params.SetExtraFields(m)
+		}
 	}
 
 	// Per-request options
@@ -111,7 +120,7 @@ func sendToModel(msg *dipper.Message) {
 	shouldStream, _ := dipper.GetMapDataBool(msg.Payload, "should_stream")
 	if shouldStream {
 		reqOpts = append(reqOpts, option.WithJSONSet("stream_options", map[string]interface{}{"include_usage": true}))
-		sendToModelStreaming(ctx, client, params, reqOpts, sessionID)
+		sendToModelStreaming(ctx, client, params, reqOpts, sessionID, reasoningExtraction)
 
 		return
 	}
@@ -124,22 +133,7 @@ func sendToModel(msg *dipper.Message) {
 		return
 	}
 
-	choice := completion.Choices[0]
-
-	var agentMsg agentpkg.Message
-	if choice.FinishReason == "tool_calls" {
-		agentMsg = buildToolCallMessage(choice.Message.ToolCalls)
-	} else {
-		agentMsg = agentpkg.Message{
-			Role:       agentpkg.RoleAgent,
-			Content:    choice.Message.Content,
-			IsComplete: true,
-		}
-	}
-	agentMsg.InputTokens = int(completion.Usage.PromptTokens)
-	agentMsg.OutputTokens = int(completion.Usage.CompletionTokens)
-
-	driver.SendMessage(agentbusMessage(sessionID, agentMsg))
+	handleIncomingMessage(completion, sessionID, reasoningExtraction)
 }
 
 // agentbusMessage wraps an agent message in a dipper transport message for the agentbus receive channel.
@@ -160,7 +154,7 @@ func agentbusMessage(sessionID string, msg agentpkg.Message) *dipper.Message {
 // once the stream closes.  Tool-call responses are accumulated and sent as a
 // single tool message at the end.
 func sendToModelStreaming(ctx context.Context, client *openai.Client, params openai.ChatCompletionNewParams,
-	reqOpts []option.RequestOption, sessionID string,
+	reqOpts []option.RequestOption, sessionID string, reasoningExtraction string,
 ) {
 	streamer := client.Chat.Completions.NewStreaming(ctx, params, reqOpts...)
 	acc := openai.ChatCompletionAccumulator{}
@@ -185,13 +179,27 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 			return
 		}
 
-		// Send each content delta immediately as a non-complete chunk.
-		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
-			driver.SendMessage(agentbusMessage(sessionID, agentpkg.Message{
-				Role:       agentpkg.RoleAgent,
-				Content:    chunk.Choices[0].Delta.Content,
-				IsComplete: false,
-			}))
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		choice := chunk.Choices[0]
+		msg := agentpkg.Message{
+			Role:       agentpkg.RoleAgent,
+			Content:    choice.Delta.Content,
+			IsComplete: false,
+		}
+
+		if len(choice.Delta.JSON.ExtraFields) > 0 && reasoningExtraction != "" {
+			if think, ok := choice.Delta.JSON.ExtraFields[reasoningExtraction]; ok {
+				var reasoning string
+				dipper.Must(json.Unmarshal([]byte(think.Raw()), &reasoning))
+				msg.Thoughts = reasoning
+			}
+		}
+
+		if len(msg.Thoughts) > 0 || len(msg.Content) > 0 {
+			driver.SendMessage(agentbusMessage(sessionID, msg))
 		}
 	}
 
@@ -203,22 +211,37 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 		return
 	}
 
-	// Send the terminal message based on finish reason.
-	choice := acc.Choices[0]
+	handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
+}
 
-	if choice.FinishReason == "tool_calls" {
-		tcMsg := buildToolCallMessage(choice.Message.ToolCalls)
-		tcMsg.InputTokens = int(acc.Usage.PromptTokens)
-		tcMsg.OutputTokens = int(acc.Usage.CompletionTokens)
-		driver.SendMessage(agentbusMessage(sessionID, tcMsg))
-	} else {
-		driver.SendMessage(agentbusMessage(sessionID, agentpkg.Message{
-			Role:         agentpkg.RoleAgent,
-			IsComplete:   true,
-			InputTokens:  int(acc.Usage.PromptTokens),
-			OutputTokens: int(acc.Usage.CompletionTokens),
-		}))
+// handleIncomingMessage processes a single OpenAI message from the streaming endpoint,
+// sending appropriate agent messages for content, tool calls, and reasoning texts.
+func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoningExtraction string) {
+	choice := msg.Choices[0]
+	cm := choice.Message
+
+	agentMsg := agentpkg.Message{
+		Role:       agentpkg.RoleAgent,
+		IsComplete: true,
+		Content:    cm.Content,
 	}
+
+	if fields := cm.JSON.ExtraFields; fields != nil && reasoningExtraction != "" {
+		if think, ok := fields[reasoningExtraction]; ok {
+			var reasoning string
+			dipper.Must(json.Unmarshal([]byte(think.Raw()), &reasoning))
+			agentMsg.Thoughts = reasoning
+		}
+	}
+
+	if choice.FinishReason == "tool_calls" && len(cm.ToolCalls) > 0 {
+		agentMsg.ToolCalls = buildToolCalls(cm.ToolCalls)
+	}
+
+	agentMsg.InputTokens = int(msg.Usage.PromptTokens)
+	agentMsg.OutputTokens = int(msg.Usage.CompletionTokens)
+
+	driver.SendMessage(agentbusMessage(sessionID, agentMsg))
 }
 
 // newOpenAIClient creates an OpenAI client from the per-engine configuration.
@@ -236,7 +259,7 @@ func newOpenAIClient(cfg engineConfig) *openai.Client {
 
 // buildMessages converts the agent conversation history into the slice of
 // OpenAI message params expected by ChatCompletionNewParams.Messages.
-func buildMessages(history []agentpkg.Message) []openai.ChatCompletionMessageParamUnion {
+func buildMessages(history []agentpkg.Message, reasoningInjection string) []openai.ChatCompletionMessageParamUnion {
 	msgs := make([]openai.ChatCompletionMessageParamUnion, 0, len(history))
 	var lastToolCallIDs []string
 
@@ -249,36 +272,21 @@ func buildMessages(history []agentpkg.Message) []openai.ChatCompletionMessagePar
 			msgs = append(msgs, openai.UserMessage(msg.Content))
 
 		case agentpkg.RoleAgent:
-			msgs = append(msgs, openai.AssistantMessage(msg.Content))
+			oMsg := openai.AssistantMessage(msg.Content)
+			if len(msg.Thoughts) > 0 && reasoningInjection != "" {
+				extras := map[string]interface{}{}
+				dipper.MapSet(extras, reasoningInjection, msg.Thoughts)
+				oMsg.OfAssistant.SetExtraFields(extras)
+			}
+			if len(msg.ToolCalls) > 0 {
+				oMsg.OfAssistant.ToolCalls, lastToolCallIDs = buildOpenAIToolCalls(histIdx, &msg)
+			}
+			msgs = append(msgs, oMsg)
 
 		case agentpkg.RoleTool:
-			// The model previously requested tool calls; reconstruct the
-			// assistant message with ToolCalls so OpenAI sees the full turn.
-			ids := make([]string, len(msg.ToolCalls))
-			toolCalls := make([]openai.ChatCompletionMessageToolCallUnionParam, len(msg.ToolCalls))
-
-			for i, tc := range msg.ToolCalls {
-				id := fmt.Sprintf("call_%d_%d", histIdx, i)
-				ids[i] = id
-
-				argBytes, _ := json.Marshal(tc.Params)
-				toolCalls[i] = openai.ChatCompletionMessageToolCallUnionParam{
-					OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
-						ID: id,
-						Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
-							Name:      tc.FuncName,
-							Arguments: string(argBytes),
-						},
-					},
-				}
-			}
-
-			msgs = append(msgs, openai.ChatCompletionMessageParamUnion{
-				OfAssistant: &openai.ChatCompletionAssistantMessageParam{
-					ToolCalls: toolCalls,
-				},
-			})
-			lastToolCallIDs = ids
+			oMsg := openai.ChatCompletionMessageParamUnion{}
+			oMsg.OfAssistant.ToolCalls, lastToolCallIDs = buildOpenAIToolCalls(histIdx, &msg)
+			msgs = append(msgs, oMsg)
 
 		case agentpkg.RoleToolResult:
 			// One ToolMessage per result, matched to the prior tool call IDs.
@@ -295,6 +303,32 @@ func buildMessages(history []agentpkg.Message) []openai.ChatCompletionMessagePar
 	}
 
 	return msgs
+}
+
+// buildOpenAIToolCalls converts agentpkg ToolCalls to openai ToolCalls.
+func buildOpenAIToolCalls(histIdx int, msg *agentpkg.Message) ([]openai.ChatCompletionMessageToolCallUnionParam, []string) {
+	// The model previously requested tool calls; reconstruct the
+	// assistant message with ToolCalls so OpenAI sees the full turn.
+	ids := make([]string, len(msg.ToolCalls))
+	toolCalls := make([]openai.ChatCompletionMessageToolCallUnionParam, len(msg.ToolCalls))
+
+	for i, tc := range msg.ToolCalls {
+		id := fmt.Sprintf("call_%d_%d", histIdx, i)
+		ids[i] = id
+
+		argBytes, _ := json.Marshal(tc.Params)
+		toolCalls[i] = openai.ChatCompletionMessageToolCallUnionParam{
+			OfFunction: &openai.ChatCompletionMessageFunctionToolCallParam{
+				ID: id,
+				Function: openai.ChatCompletionMessageFunctionToolCallFunctionParam{
+					Name:      tc.FuncName,
+					Arguments: string(argBytes),
+				},
+			},
+		}
+	}
+
+	return toolCalls, ids
 }
 
 // buildTools converts the agent tool map into the OpenAI tool params slice.
@@ -339,9 +373,9 @@ func buildTools(tools map[string]agentpkg.Tool) []openai.ChatCompletionToolUnion
 	return result
 }
 
-// buildToolCallMessage converts OpenAI tool-call response entries into the
-// agent message format consumed by the agent session.
-func buildToolCallMessage(toolCalls []openai.ChatCompletionMessageToolCallUnion) agentpkg.Message {
+// buildToolCalls converts OpenAI tool-call response entries into the
+// agent package ToolCall format consumed by the agent session.
+func buildToolCalls(toolCalls []openai.ChatCompletionMessageToolCallUnion) []agentpkg.ToolCall {
 	calls := make([]agentpkg.ToolCall, 0, len(toolCalls))
 
 	for _, tc := range toolCalls {
@@ -356,8 +390,5 @@ func buildToolCallMessage(toolCalls []openai.ChatCompletionMessageToolCallUnion)
 		})
 	}
 
-	return agentpkg.Message{
-		Role:      agentpkg.RoleTool,
-		ToolCalls: calls,
-	}
+	return calls
 }

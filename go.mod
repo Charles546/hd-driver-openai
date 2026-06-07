@@ -3,7 +3,7 @@ module github.com/honeydipper/hd-driver-openai
 go 1.25.0
 
 require (
-	github.com/honeydipper/honeydipper/v4 v4.0.0-alpha3
+	github.com/honeydipper/honeydipper/v4 v4.0.0-alpha4
 	github.com/mitchellh/mapstructure v1.5.0
 	github.com/openai/openai-go/v3 v3.36.0
 	github.com/stretchr/testify v1.11.1
