@@ -1,3 +1,10 @@
+## [1.1.1](https://github.com/Charles546/hd-driver-openai/compare/v1.1.0...v1.1.1) (2026-06-07)
+
+
+### Bug Fixes
+
+* handling reasoning messages with agent_settings ([#5](https://github.com/Charles546/hd-driver-openai/issues/5)) ([99423f6](https://github.com/Charles546/hd-driver-openai/commit/99423f6fd475e06fe5448d13e737673884bbfe36))
+
 # [1.1.0](https://github.com/Charles546/hd-driver-openai/compare/v1.0.1...v1.1.0) (2026-06-05)
 
 
