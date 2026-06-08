@@ -272,7 +272,12 @@ func buildMessages(history []agentpkg.Message, reasoningInjection string) []open
 			msgs = append(msgs, openai.UserMessage(msg.Content))
 
 		case agentpkg.RoleAgent:
-			oMsg := openai.AssistantMessage(msg.Content)
+			var oMsg openai.ChatCompletionMessageParamUnion
+			if len(msg.Content) > 0 {
+				oMsg = openai.AssistantMessage(msg.Content)
+			} else {
+				oMsg.OfAssistant = &openai.ChatCompletionAssistantMessageParam{}
+			}
 			if len(msg.Thoughts) > 0 && reasoningInjection != "" {
 				extras := map[string]interface{}{}
 				dipper.MapSet(extras, reasoningInjection, msg.Thoughts)
