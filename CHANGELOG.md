@@ -1,3 +1,10 @@
+## [1.1.2](https://github.com/Charles546/hd-driver-openai/compare/v1.1.1...v1.1.2) (2026-06-08)
+
+
+### Bug Fixes
+
+* assistant message content null ([#6](https://github.com/Charles546/hd-driver-openai/issues/6)) ([4bf0dc9](https://github.com/Charles546/hd-driver-openai/commit/4bf0dc92921efa3bf5dff566df0e3cc6bd56a0b1))
+
 ## [1.1.1](https://github.com/Charles546/hd-driver-openai/compare/v1.1.0...v1.1.1) (2026-06-07)
 
 
