@@ -1,3 +1,10 @@
+## [1.1.3](https://github.com/Charles546/hd-driver-openai/compare/v1.1.2...v1.1.3) (2026-06-09)
+
+
+### Bug Fixes
+
+* check finish reason to confirm turn complete ([#7](https://github.com/Charles546/hd-driver-openai/issues/7)) ([1f8e20d](https://github.com/Charles546/hd-driver-openai/commit/1f8e20d7d393e8f6c4a23d5dec386c4f8f01aa71))
+
 ## [1.1.2](https://github.com/Charles546/hd-driver-openai/compare/v1.1.1...v1.1.2) (2026-06-08)
 
 
