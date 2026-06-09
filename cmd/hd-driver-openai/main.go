@@ -222,7 +222,7 @@ func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoni
 
 	agentMsg := agentpkg.Message{
 		Role:       agentpkg.RoleAgent,
-		IsComplete: true,
+		IsComplete: choice.FinishReason == "stop" || choice.FinishReason == "tool_calls" || len(cm.ToolCalls) > 0,
 		Content:    cm.Content,
 	}
 
@@ -289,7 +289,9 @@ func buildMessages(history []agentpkg.Message, reasoningInjection string) []open
 			msgs = append(msgs, oMsg)
 
 		case agentpkg.RoleTool:
-			oMsg := openai.ChatCompletionMessageParamUnion{}
+			oMsg := openai.ChatCompletionMessageParamUnion{
+				OfAssistant: &openai.ChatCompletionAssistantMessageParam{},
+			}
 			oMsg.OfAssistant.ToolCalls, lastToolCallIDs = buildOpenAIToolCalls(histIdx, &msg)
 			msgs = append(msgs, oMsg)
 
