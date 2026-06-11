@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/Charles546/hd-driver-openai/compare/v1.1.3...v1.2.0) (2026-06-11)
+
+
+### Features
+
+* add configurable retry with exponential backoff for API errors ([#9](https://github.com/Charles546/hd-driver-openai/issues/9)) ([cb66c0e](https://github.com/Charles546/hd-driver-openai/commit/cb66c0e8b3f88f1aee4b12c415e735f6708cd9ae))
+
 ## [1.1.3](https://github.com/Charles546/hd-driver-openai/compare/v1.1.2...v1.1.3) (2026-06-09)
 
 
