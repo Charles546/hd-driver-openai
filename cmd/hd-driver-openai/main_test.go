@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	agentpkg "github.com/honeydipper/honeydipper/v4/pkg/agent"
 	"github.com/honeydipper/honeydipper/v4/pkg/dipper"
@@ -29,6 +30,101 @@ func TestMain(m *testing.M) {
 		dipper.GetLogger("test service", "DEBUG", f, f)
 	}
 	os.Exit(m.Run())
+}
+
+// tryFetchMessage attempts to read one message from the pipe, recovering from
+// the EOF panic that dipper.FetchMessage raises when the writer is closed with
+// no data.  Returns nil when no message was produced.
+func tryFetchMessage(r io.Reader) (msg *dipper.Message) {
+	defer func() { _ = recover() }()
+
+	return dipper.FetchMessage(r)
+}
+
+// ─── extractAPIError ──────────────────────────────────────────────────────────
+
+func TestExtractAPIError_NoError(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"id":"chatcmpl-abc","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}]}`
+	code, msg, errType, retryable := extractAPIError(raw)
+	assert.Empty(t, code)
+	assert.Empty(t, msg)
+	assert.Empty(t, errType)
+	assert.False(t, retryable)
+}
+
+func TestExtractAPIError_RateLimit(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"error":{"code":"rate_limit_exceeded","message":"Rate limit exceeded, retry later.","type":"requests"}}`
+	code, msg, errType, retryable := extractAPIError(raw)
+	assert.Equal(t, "rate_limit_exceeded", code)
+	assert.Equal(t, "Rate limit exceeded, retry later.", msg)
+	assert.Equal(t, "requests", errType)
+	assert.True(t, retryable)
+}
+
+func TestExtractAPIError_InsufficientQuota(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"error":{"code":"insufficient_quota","message":"You have exceeded your quota.","type":"requests"}}`
+	code, _, _, retryable := extractAPIError(raw)
+	assert.Equal(t, "insufficient_quota", code)
+	assert.True(t, retryable)
+}
+
+func TestExtractAPIError_ServerError(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"error":{"code":"internal_error","message":"The server encountered an error.","type":"server_error"}}`
+	code, msg, errType, retryable := extractAPIError(raw)
+	assert.Equal(t, "internal_error", code)
+	assert.Equal(t, "server_error", errType)
+	assert.True(t, retryable)
+	_ = msg
+}
+
+func TestExtractAPIError_InvalidRequest(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"error":{"code":"invalid_api_key","message":"You didn't provide an API key.","type":"invalid_request_error"}}`
+	code, msg, errType, retryable := extractAPIError(raw)
+	assert.Equal(t, "invalid_api_key", code)
+	assert.Equal(t, "invalid_request_error", errType)
+	assert.False(t, retryable)
+	_ = msg
+}
+
+func TestExtractAPIError_BadRequest(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"error":{"code":"bad_request","message":"Invalid parameter.","type":"invalid_request_error"}}`
+	code, msg, errType, retryable := extractAPIError(raw)
+	assert.Equal(t, "bad_request", code)
+	assert.Equal(t, "invalid_request_error", errType)
+	assert.False(t, retryable)
+	_ = msg
+}
+
+func TestExtractAPIError_InvalidJSON(t *testing.T) {
+	t.Parallel()
+
+	code, msg, errType, retryable := extractAPIError(`not-json`)
+	assert.Empty(t, code)
+	assert.Empty(t, msg)
+	assert.Empty(t, errType)
+	assert.False(t, retryable)
+}
+
+func TestExtractAPIError_EmptyJSON(t *testing.T) {
+	t.Parallel()
+
+	code, msg, errType, retryable := extractAPIError(`{}`)
+	assert.Empty(t, code)
+	assert.Empty(t, msg)
+	assert.Empty(t, errType)
+	assert.False(t, retryable)
 }
 
 // ─── buildMessages ────────────────────────────────────────────────────────────
@@ -241,6 +337,18 @@ func openAIToolCallBody(toolName, argsJSON string) map[string]interface{} {
 	}
 }
 
+// openAIErrorBody returns a mock HTTP 200 response body containing an OpenAI
+// API error (e.g. rate limit, auth failure) instead of valid completion data.
+func openAIErrorBody(errCode, errMsg, errType string) map[string]interface{} {
+	return map[string]interface{}{
+		"error": map[string]interface{}{
+			"code":    errCode,
+			"message": errMsg,
+			"type":    errType,
+		},
+	}
+}
+
 func setupDriverWithServer(ts *httptest.Server) (io.Reader, *io.PipeWriter) {
 	outReader, outWriter := io.Pipe()
 	driver = &dipper.Driver{
@@ -340,6 +448,75 @@ func TestSendToModel_UnknownEngine(t *testing.T) {
 	}
 	msg := testMessage("nonexistent")
 	assert.NotPanics(t, func() { sendToModel(msg) })
+}
+
+// ─── sendToModel API error handling ──────────────────────────────────────────
+
+func TestSendToModel_RateLimitError(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// Simulate HTTP 200 with a rate-limit error body (no choices).
+	ts := mockOpenAIServer(openAIErrorBody("rate_limit_exceeded", "Rate limit exceeded.", "requests"))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts)
+	defer outWriter.Close()
+
+	// sendToModel should log the error and return without sending any message.
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	// No message should have been sent; FetchMessage would panic on EOF so use
+	// tryFetchMessage which recovers and returns nil.
+	outWriter.Close()
+	msg := tryFetchMessage(outReader)
+	assert.Nil(t, msg, "no message should be sent for retryable errors")
+}
+
+func TestSendToModel_InvalidRequestError(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// Simulate HTTP 200 with a non-retryable error body.
+	ts := mockOpenAIServer(openAIErrorBody("invalid_api_key", "Invalid API key.", "invalid_request_error"))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts)
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// This should panic (caught by defer) and send an error message to the session.
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "sess-test", result.Labels["agent_session_id"])
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "invalid_api_key")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
+}
+
+func TestSendToModel_ServerError(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// Simulate HTTP 200 with a server error body.
+	ts := mockOpenAIServer(openAIErrorBody("internal_error", "Server error.", "server_error"))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts)
+	defer outWriter.Close()
+
+	// Server errors are retryable; no message should be sent.
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	outWriter.Close()
+	msg := tryFetchMessage(outReader)
+	assert.Nil(t, msg, "no message should be sent for retryable server errors")
 }
 
 // ─── streaming sendToModel ─────────────────────────────────────────────────────
@@ -534,4 +711,92 @@ func TestSendToModel_StreamingToolCallResponse(t *testing.T) {
 
 	call := rawCalls[0].(map[string]interface{})
 	assert.Equal(t, "search_web", call["FuncName"])
+}
+
+// ─── sendToModel streaming API error handling ────────────────────────────────
+
+// streamingErrorChunk returns an SSE data chunk containing an OpenAI API error
+// object.  This simulates a streaming endpoint returning an error event inline.
+func streamingErrorChunk(errCode, errMsg, errType string) map[string]interface{} {
+	return map[string]interface{}{
+		"error": map[string]interface{}{
+			"code":    errCode,
+			"message": errMsg,
+			"type":    errType,
+		},
+	}
+}
+
+func TestSendToModel_StreamingRateLimitError(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// Simulate a stream that returns a rate-limit error as the first event.
+	chunks := []map[string]interface{}{
+		streamingErrorChunk("rate_limit_exceeded", "Rate limit exceeded.", "requests"),
+	}
+	ts := mockSSEServer(chunks)
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts)
+	defer outWriter.Close()
+
+	// Retryable: should return without sending any message.
+	assert.NotPanics(t, func() {
+		sendToModel(&dipper.Message{
+			Channel: "rpc",
+			Subject: "send_to_model",
+			Labels:  map[string]string{"agent_session_id": "sess-stream-rate"},
+			Payload: map[string]interface{}{
+				"engine":        "stream-engine",
+				"history":       []interface{}{},
+				"should_stream": true,
+			},
+		})
+	})
+
+	outWriter.Close()
+	msg := tryFetchMessage(outReader)
+	assert.Nil(t, msg, "no message should be sent for retryable streaming errors")
+}
+
+func TestSendToModel_StreamingInvalidAuthError(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// Simulate a stream that returns an auth error.
+	chunks := []map[string]interface{}{
+		streamingErrorChunk("invalid_api_key", "Invalid API key.", "invalid_request_error"),
+	}
+	ts := mockSSEServer(chunks)
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts)
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// Non-retryable: should send an error message to the session via deferred recovery.
+	assert.NotPanics(t, func() {
+		sendToModel(&dipper.Message{
+			Channel: "rpc",
+			Subject: "send_to_model",
+			Labels:  map[string]string{"agent_session_id": "sess-stream-auth"},
+			Payload: map[string]interface{}{
+				"engine":        "stream-engine",
+				"history":       []interface{}{},
+				"should_stream": true,
+			},
+		})
+	})
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "invalid_api_key")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 }
