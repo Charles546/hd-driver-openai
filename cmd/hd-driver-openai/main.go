@@ -14,12 +14,15 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"strings"
 
 	agentpkg "github.com/honeydipper/honeydipper/v4/pkg/agent"
 	"github.com/honeydipper/honeydipper/v4/pkg/dipper"
 	"github.com/mitchellh/mapstructure"
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/ssestream"
+	"github.com/tidwall/gjson"
 )
 
 var driver *dipper.Driver
@@ -127,6 +130,18 @@ func sendToModel(msg *dipper.Message) {
 
 	completion := dipper.Must(client.Chat.Completions.New(ctx, params, reqOpts...)).(*openai.ChatCompletion)
 
+	// Check for API-level errors hidden in HTTP 200 responses (e.g. 429 rate limit).
+	if code, msg, errType, retryable := extractAPIError(completion.RawJSON()); code != "" {
+		dipper.Logger.Errorf("[openai] send_to_model API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
+		if retryable {
+			return
+		}
+
+		dipper.Logger.Panicf("[openai] send_to_model non-retryable API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
+
+		return
+	}
+
 	if len(completion.Choices) == 0 {
 		dipper.Logger.Panicf("[openai] send_to_model no choices returned session=%s", sessionID)
 
@@ -147,6 +162,41 @@ func agentbusMessage(sessionID string, msg agentpkg.Message) *dipper.Message {
 		},
 		Payload: map[string]interface{}{"message": msg},
 	}
+}
+
+// extractAPIError inspects a raw JSON response body for an OpenAI API error
+// object.  It returns the error code, message, type, and whether the error is
+// considered retryable.  When no error is found, all return values are zero-valued.
+//
+// Retryable errors include those with code "rate_limit_exceeded" (429) and
+// server-error types (5xx).  All other error codes (e.g. 400, 401, 403) are
+// treated as non-retryable.
+func extractAPIError(rawJSON string) (code, message, errType string, retryable bool) {
+	if !gjson.Valid(rawJSON) {
+		return "", "", "", false
+	}
+
+	errVal := gjson.Get(rawJSON, "error")
+	if !errVal.Exists() {
+		return "", "", "", false
+	}
+
+	code = gjson.Get(rawJSON, "error.code").String()
+	message = gjson.Get(rawJSON, "error.message").String()
+	errType = gjson.Get(rawJSON, "error.type").String()
+
+	// Rate-limit errors are retryable.
+	if code == "rate_limit_exceeded" || code == "insufficient_quota" {
+		return code, message, errType, true
+	}
+
+	// Server-side error types (5xx-equivalent) are retryable.
+	if strings.HasPrefix(errType, "server_error") {
+		return code, message, errType, true
+	}
+
+	// All other errors (e.g. invalid_request_error, 400, 401, 403) are not retryable.
+	return code, message, errType, false
 }
 
 // sendToModelStreaming calls the OpenAI streaming endpoint, emits each content
@@ -203,9 +253,37 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 		}
 	}
 
-	dipper.Must(streamer.Err())
+	// Check for stream-level errors (including API errors embedded in SSE events).
+	if err := streamer.Err(); err != nil {
+		if streamErr, ok := err.(*ssestream.StreamError); ok {
+			if code, msg, errType, retryable := extractAPIError(string(streamErr.Event.Data)); code != "" {
+				dipper.Logger.Errorf("[openai] streaming API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
+				if retryable {
+					return
+				}
+
+				dipper.Logger.Panicf("[openai] streaming API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
+
+				return
+			}
+		}
+
+		dipper.Must(err)
+	}
 
 	if len(acc.Choices) == 0 {
+		// Check the accumulated response for API-level errors (e.g. HTTP 200 with error body).
+		if code, msg, errType, retryable := extractAPIError(acc.RawJSON()); code != "" {
+			dipper.Logger.Errorf("[openai] streaming API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
+			if retryable {
+				return
+			}
+
+			dipper.Logger.Panicf("[openai] streaming API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
+
+			return
+		}
+
 		dipper.Logger.Panicf("[openai] streaming no choices returned session=%s", sessionID)
 
 		return
