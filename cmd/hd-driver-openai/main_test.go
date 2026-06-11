@@ -453,7 +453,7 @@ func TestSendToModel_UnknownEngine(t *testing.T) {
 // ─── sendToModel API error handling ──────────────────────────────────────────
 
 func TestSendToModel_RateLimitError(t *testing.T) {
-	t.Parallel()
+	// Note: NOT t.Parallel() because tests share the global driver variable.
 
 	// Simulate HTTP 200 with a rate-limit error body (no choices).
 	ts := mockOpenAIServer(openAIErrorBody("rate_limit_exceeded", "Rate limit exceeded.", "requests"))
@@ -473,7 +473,7 @@ func TestSendToModel_RateLimitError(t *testing.T) {
 }
 
 func TestSendToModel_InvalidRequestError(t *testing.T) {
-	t.Parallel()
+	// Note: NOT t.Parallel() because tests share the global driver variable.
 
 	// Simulate HTTP 200 with a non-retryable error body.
 	ts := mockOpenAIServer(openAIErrorBody("invalid_api_key", "Invalid API key.", "invalid_request_error"))
@@ -502,7 +502,7 @@ func TestSendToModel_InvalidRequestError(t *testing.T) {
 }
 
 func TestSendToModel_ServerError(t *testing.T) {
-	t.Parallel()
+	// Note: NOT t.Parallel() because tests share the global driver variable.
 
 	// Simulate HTTP 200 with a server error body.
 	ts := mockOpenAIServer(openAIErrorBody("internal_error", "Server error.", "server_error"))
@@ -728,7 +728,7 @@ func streamingErrorChunk(errCode, errMsg, errType string) map[string]interface{}
 }
 
 func TestSendToModel_StreamingRateLimitError(t *testing.T) {
-	t.Parallel()
+	// Note: NOT t.Parallel() because tests share the global driver variable.
 
 	// Simulate a stream that returns a rate-limit error as the first event.
 	chunks := []map[string]interface{}{
@@ -760,7 +760,7 @@ func TestSendToModel_StreamingRateLimitError(t *testing.T) {
 }
 
 func TestSendToModel_StreamingInvalidAuthError(t *testing.T) {
-	t.Parallel()
+	// Note: NOT t.Parallel() because tests share the global driver variable.
 
 	// Simulate a stream that returns an auth error.
 	chunks := []map[string]interface{}{
