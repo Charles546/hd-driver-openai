@@ -36,7 +36,7 @@ func TestMain(m *testing.M) {
 // the EOF panic that dipper.FetchMessage raises when the writer is closed with
 // no data.  Returns nil when no message was produced.
 func tryFetchMessage(r io.Reader) (msg *dipper.Message) {
-	defer func() { recover() }() //nolint:errcheck // EOF panics are expected
+	defer func() { _ = recover() }()
 
 	return dipper.FetchMessage(r)
 }
