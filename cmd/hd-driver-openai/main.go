@@ -12,6 +12,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"strings"
@@ -131,17 +132,7 @@ func sendToModel(msg *dipper.Message) {
 	completion := dipper.Must(client.Chat.Completions.New(ctx, params, reqOpts...)).(*openai.ChatCompletion)
 
 	// Check for API-level errors hidden in HTTP 200 responses (e.g. 429 rate limit).
-	if code, msg, errType, retryable := extractAPIError(completion.RawJSON()); code != "" {
-		dipper.Logger.Errorf("[openai] send_to_model API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
-		if retryable {
-			return
-		}
-
-		dipper.Logger.Panicf("[openai] send_to_model non-retryable API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
-
-		return
-	}
-
+	handleAPIErrorInResponse(completion.RawJSON(), sessionID)
 	if len(completion.Choices) == 0 {
 		dipper.Logger.Panicf("[openai] send_to_model no choices returned session=%s", sessionID)
 
@@ -197,6 +188,37 @@ func extractAPIError(rawJSON string) (code, message, errType string, retryable b
 
 	// All other errors (e.g. invalid_request_error, 400, 401, 403) are not retryable.
 	return code, message, errType, false
+}
+
+// handleAPIErrorInResponse checks a raw JSON response for an OpenAI API error.
+// For retryable errors it silently returns; for non-retryable errors it panics
+// (caught by the caller's deferred recovery, which sends an error to the session).
+func handleAPIErrorInResponse(rawJSON string, sessionID string) {
+	code, msg, errType, retryable := extractAPIError(rawJSON)
+	if code == "" {
+		return
+	}
+
+	dipper.Logger.Errorf("[openai] API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
+	if retryable {
+		return
+	}
+
+	dipper.Logger.Panicf("[openai] non-retryable API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
+}
+
+// handleStreamError checks a stream error for embedded API error data.
+// Returns true if the error was handled (retryable or non-retryable panic);
+// returns false if the error is not an API error and should be propagated.
+func handleStreamError(err error, sessionID string) bool {
+	var streamErr *ssestream.StreamError
+	if !errors.As(err, &streamErr) {
+		return false
+	}
+
+	handleAPIErrorInResponse(string(streamErr.Event.Data), sessionID)
+
+	return true
 }
 
 // sendToModelStreaming calls the OpenAI streaming endpoint, emits each content
@@ -255,35 +277,15 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 
 	// Check for stream-level errors (including API errors embedded in SSE events).
 	if err := streamer.Err(); err != nil {
-		if streamErr, ok := err.(*ssestream.StreamError); ok {
-			if code, msg, errType, retryable := extractAPIError(string(streamErr.Event.Data)); code != "" {
-				dipper.Logger.Errorf("[openai] streaming API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
-				if retryable {
-					return
-				}
-
-				dipper.Logger.Panicf("[openai] streaming API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
-
-				return
-			}
+		if !handleStreamError(err, sessionID) {
+			dipper.Must(err)
 		}
 
-		dipper.Must(err)
+		return
 	}
 
 	if len(acc.Choices) == 0 {
-		// Check the accumulated response for API-level errors (e.g. HTTP 200 with error body).
-		if code, msg, errType, retryable := extractAPIError(acc.RawJSON()); code != "" {
-			dipper.Logger.Errorf("[openai] streaming API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
-			if retryable {
-				return
-			}
-
-			dipper.Logger.Panicf("[openai] streaming API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
-
-			return
-		}
-
+		handleAPIErrorInResponse(acc.RawJSON(), sessionID)
 		dipper.Logger.Panicf("[openai] streaming no choices returned session=%s", sessionID)
 
 		return
