@@ -7,6 +7,7 @@ require (
 	github.com/mitchellh/mapstructure v1.5.0
 	github.com/openai/openai-go/v3 v3.36.0
 	github.com/stretchr/testify v1.11.1
+	github.com/tidwall/gjson v1.18.0
 )
 
 require (
@@ -32,7 +33,6 @@ require (
 	github.com/protocolbuffers/txtpbfmt v0.0.0-20260217160748-a481f6a22f94 // indirect
 	github.com/shopspring/decimal v1.3.1 // indirect
 	github.com/spf13/cast v1.6.0 // indirect
-	github.com/tidwall/gjson v1.18.0 // indirect
 	github.com/tidwall/match v1.2.0 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
