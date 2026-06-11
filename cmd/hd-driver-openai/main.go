@@ -15,8 +15,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"math/rand/v2"
+	"net/http"
 	"strings"
 	"time"
 
@@ -181,21 +183,34 @@ func sendToModel(msg *dipper.Message) {
 	err := retryWithBackoff(ctx, retryMaxAttempts, retryInitialDelay, retryMaxDelay, func() (bool, error) {
 		completion, err := client.Chat.Completions.New(ctx, params, reqOpts...)
 		if err != nil {
-			// SDK-level error (e.g. network, bad HTTP status >=400).
-			// Treat these as non-retryable to avoid masking serious issues.
-			return false, fmt.Errorf("API call failed: %w", err)
+			// SDK-level error (network, timeout, or HTTP status >=400).
+			return classifySDKError(err)
 		}
 
 		lastErrInfo = extractAPIErrorInfo(completion.RawJSON())
 		if lastErrInfo == nil {
-			// Success — no API error detected.
+			// No API-level error detected.  Check for empty choices as a safety net.
+			if len(completion.Choices) == 0 {
+				dipper.Logger.Warningf("[openai] no choices in response session=%s: raw=%s",
+					sessionID, completion.RawJSON())
+
+				// Return as non-retryable so the deferred recovery sends an error to the session.
+				return false, fmt.Errorf("%w: response contains no choices", errNonRetryable)
+			}
+
+			// Success.
 			handleIncomingMessage(completion, sessionID, reasoningExtraction)
 
 			return false, nil
 		}
 
-		dipper.Logger.Warningf("[openai] API error (attempt) session=%s: code=%s type=%s message=%s",
-			sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+		// Log the raw error body at debug level for troubleshooting.
+		dipper.Logger.Debugf("[openai] raw error body session=%s: code=%s type=%s raw=%s",
+			sessionID, lastErrInfo.Code, lastErrInfo.Type, completion.RawJSON())
+
+		errTypeLabel := classifyErrorTypeLabel(lastErrInfo)
+		dipper.Logger.Warningf("[openai] API error (%s) session=%s: code=%s type=%s message=%s",
+			errTypeLabel, sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
 
 		if !lastErrInfo.Retryable {
 			return false, fmt.Errorf("%w: code=%s type=%s message=%s",
@@ -212,14 +227,62 @@ func sendToModel(msg *dipper.Message) {
 		// Determine if the final error is retryable (exhausted) or non-retryable.
 		var retryErr *retryAfterError
 
-		if errors.As(err, &retryErr) {
-			// All retries exhausted.
+		switch {
+		case errors.As(err, &retryErr):
+			// All retries exhausted — log the final failure reason clearly.
 			dipper.Logger.Errorf("[openai] retry exhausted session=%s: %v", sessionID, err)
-		} else {
+
+		case errors.Is(err, errNonRetryable):
 			// Non-retryable: let the deferred recovery send an error to the session.
+			dipper.Logger.Infof("[openai] non-retryable error session=%s: %v", sessionID, err)
 			dipper.Logger.Panicf("[openai] non-retryable API error session=%s: %v", sessionID, err)
+
+		default:
+			// Other errors (e.g. SDK errors that weren't classified): let deferred recovery handle.
+			dipper.Logger.Panicf("[openai] request error session=%s: %v", sessionID, err)
 		}
 	}
+}
+
+// classifySDKError inspects an SDK-level error and decides whether to retry.
+// HTTP 5xx errors are retryable; HTTP 4xx, network/timeout, and other errors
+// are not.  Empty/blank response bodies (EOF when parsing JSON) are also
+// treated as retryable.
+func classifySDKError(err error) (bool, error) {
+	var apiErr *openai.Error
+	if errors.As(err, &apiErr) {
+		if apiErr.StatusCode >= http.StatusInternalServerError {
+			// HTTP 5xx — retryable server error.
+			return true, &retryAfterError{
+				Err: fmt.Errorf("%w: server error (HTTP %d) code=%s type=%s message=%s",
+					errRetryable, apiErr.StatusCode, apiErr.Code, apiErr.Type, apiErr.Message),
+			}
+		}
+
+		// HTTP 4xx — non-retryable client error.
+		return false, fmt.Errorf("API call failed with HTTP %d (type=%s code=%s): %w",
+			apiErr.StatusCode, apiErr.Type, apiErr.Code, err)
+	}
+
+	// Check for empty/blank response body (EOF when parsing JSON).
+	// Some API providers return HTTP 200 with an empty body instead of a proper
+	// JSON response, which causes the SDK to fail with an EOF or JSON parse error.
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true, &retryAfterError{
+			Err: fmt.Errorf("%w: empty response body (EOF)", errRetryable),
+		}
+	}
+
+	// Check for JSON syntax errors which may indicate a blank/truncated body.
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return true, &retryAfterError{
+			Err: fmt.Errorf("%w: malformed JSON response: %w", errRetryable, syntaxErr),
+		}
+	}
+
+	// Non-API errors (network, timeout, etc.) — treat as non-retryable.
+	return false, fmt.Errorf("API call failed: %w", err)
 }
 
 // agentbusMessage wraps an agent message in a dipper transport message for the agentbus receive channel.
@@ -323,12 +386,13 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 
 			delay := calculateBackoff(attempt, retryInitialDelay, retryMaxDelay, lastErrInfo)
 
-			dipper.Logger.Infof("[openai] streaming retrying after %v (attempt %d/%d) session=%s",
-				delay, attempt+1, retryMaxAttempts, sessionID)
+			dipper.Logger.Infof("[openai] streaming retry attempt=%d/%d delay=%v session=%s",
+				attempt+1, retryMaxAttempts, delay, sessionID)
 
 			select {
 			case <-ctx.Done():
-				dipper.Logger.Panicf("[openai] context cancelled during streaming retry backoff session=%s", sessionID)
+				dipper.Logger.Panicf("[openai] context cancelled during streaming retry backoff session=%s err=%v",
+					sessionID, ctx.Err())
 
 				return
 
@@ -341,13 +405,16 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 			return // success
 		}
 
-		dipper.Logger.Warningf("[openai] streaming API error (attempt %d/%d) session=%s: code=%s type=%s message=%s",
-			attempt+1, retryMaxAttempts, sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+		errTypeLabel := classifyErrorTypeLabel(lastErrInfo)
+		dipper.Logger.Warningf("[openai] streaming API error (%s) attempt=%d/%d session=%s: code=%s type=%s message=%s",
+			errTypeLabel, attempt+1, retryMaxAttempts, sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
 
 		if !lastErrInfo.Retryable || contentDelivered {
 			// Non-retryable error, or content was already delivered.
 			if !lastErrInfo.Retryable {
 				// Non-retryable: let the deferred recovery send an error to the session.
+				dipper.Logger.Infof("[openai] non-retryable streaming error session=%s: code=%s type=%s message=%s",
+					sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
 				dipper.Logger.Panicf("[openai] non-retryable streaming API error session=%s: code=%s type=%s message=%s",
 					sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
 			}
@@ -359,13 +426,33 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 	}
 
 	// All retries exhausted.
-	dipper.Logger.Errorf("[openai] streaming retry exhausted session=%s: code=%s type=%s message=%s",
-		sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+	dipper.Logger.Errorf("[openai] streaming retry exhausted (max=%d) session=%s: code=%s type=%s message=%s",
+		retryMaxAttempts, sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+}
+
+// classifyErrorTypeLabel returns a human-readable label for the error type.
+func classifyErrorTypeLabel(info *apiErrorInfo) string {
+	if info == nil {
+		return "unknown"
+	}
+
+	switch {
+	case info.Code == "rate_limit_exceeded":
+		return "rate_limit"
+	case info.Code == "insufficient_quota":
+		return "insufficient_quota"
+	case strings.HasPrefix(info.Type, "server_error"):
+		return "server_error"
+	default:
+		return "non_retryable"
+	}
 }
 
 // runStream performs a single streaming request and returns whether any content
 // was delivered and any API error info detected.  Returns nil error info on
 // success.
+//
+//nolint:nestif // nesting in stream error handling is inherent to the logic
 func runStream(ctx context.Context, client *openai.Client, params openai.ChatCompletionNewParams,
 	reqOpts []option.RequestOption, sessionID string, reasoningExtraction string,
 ) (contentDelivered bool, errInfo *apiErrorInfo) {
@@ -427,29 +514,65 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 	if err := streamer.Err(); err != nil {
 		var streamErr *ssestream.StreamError
 		if !errors.As(err, &streamErr) {
-			dipper.Must(err)
+			// Non-SSE stream error — treat as non-retryable API failure.
+			dipper.Logger.Debugf("[openai] stream non-SSE error session=%s: %v", sessionID, err)
+			if delivered {
+				dipper.Must(err)
 
-			return delivered, nil
+				return delivered, nil
+			}
+
+			return delivered, &apiErrorInfo{
+				Code:      "stream_error",
+				Message:   err.Error(),
+				Type:      "stream_error",
+				Retryable: false,
+			}
 		}
 
-		info := extractAPIErrorInfo(string(streamErr.Event.Data))
+		rawEventData := string(streamErr.Event.Data)
+		dipper.Logger.Debugf("[openai] SSE stream error event session=%s: type=%s data=%s",
+			sessionID, streamErr.Event.Type, rawEventData)
+
+		info := extractAPIErrorInfo(rawEventData)
 		if info != nil {
 			return delivered, info
 		}
 
-		// Non-API stream error — propagate.
+		// Non-API stream error — treat as non-retryable.
+		if !delivered {
+			return delivered, &apiErrorInfo{
+				Code:      "stream_error",
+				Message:   err.Error(),
+				Type:      "stream_error",
+				Retryable: false,
+			}
+		}
+
 		dipper.Must(err)
 
 		return delivered, nil
 	}
 
 	if len(acc.Choices) == 0 {
-		info := extractAPIErrorInfo(acc.RawJSON())
+		rawJSON := acc.RawJSON()
+
+		info := extractAPIErrorInfo(rawJSON)
 		if info != nil {
 			return delivered, info
 		}
 
-		dipper.Logger.Panicf("[openai] streaming no choices returned session=%s", sessionID)
+		// No choices and no error — log raw JSON and return as non-retryable error.
+		dipper.Logger.Warningf("[openai] streaming no choices returned session=%s raw=%s", sessionID, rawJSON)
+
+		if !delivered {
+			return delivered, &apiErrorInfo{
+				Code:      "empty_response",
+				Message:   "streaming response contains no choices and no error",
+				Type:      "empty_response",
+				Retryable: false,
+			}
+		}
 
 		return delivered, nil
 	}

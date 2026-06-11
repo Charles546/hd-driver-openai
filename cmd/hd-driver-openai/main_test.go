@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -219,6 +220,120 @@ func TestExtractAPIError_EmptyJSON(t *testing.T) {
 	assert.Empty(t, msg)
 	assert.Empty(t, errType)
 	assert.False(t, retryable)
+}
+
+// ─── classifyErrorTypeLabel ──────────────────────────────────────────────────
+
+func TestClassifyErrorTypeLabel(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "unknown", classifyErrorTypeLabel(nil))
+	assert.Equal(t, "rate_limit", classifyErrorTypeLabel(&apiErrorInfo{Code: "rate_limit_exceeded"}))
+	assert.Equal(t, "insufficient_quota", classifyErrorTypeLabel(&apiErrorInfo{Code: "insufficient_quota"}))
+	assert.Equal(t, "server_error", classifyErrorTypeLabel(&apiErrorInfo{Type: "server_error"}))
+	assert.Equal(t, "server_error", classifyErrorTypeLabel(&apiErrorInfo{Type: "server_error_with_details"}))
+	assert.Equal(t, "non_retryable", classifyErrorTypeLabel(&apiErrorInfo{Code: "invalid_api_key", Type: "invalid_request_error"}))
+}
+
+// ─── classifySDKError ────────────────────────────────────────────────────────
+
+func TestClassifySDKError_5xxRetryable(t *testing.T) {
+	t.Parallel()
+
+	apiErr := &openai.Error{
+		StatusCode: http.StatusInternalServerError,
+		Code:       "internal_error",
+		Type:       "server_error",
+		Message:    "Internal server error",
+	}
+
+	shouldRetry, err := classifySDKError(apiErr)
+	assert.True(t, shouldRetry)
+	assert.ErrorIs(t, err, errRetryable)
+
+	var retryAfter *retryAfterError
+	assert.True(t, errors.As(err, &retryAfter))
+	assert.Contains(t, err.Error(), "server error (HTTP 500)")
+}
+
+func TestClassifySDKError_5xxRetryableServiceUnavailable(t *testing.T) {
+	t.Parallel()
+
+	apiErr := &openai.Error{
+		StatusCode: http.StatusServiceUnavailable,
+		Code:       "service_unavailable",
+		Type:       "server_error",
+		Message:    "Service unavailable",
+	}
+
+	shouldRetry, err := classifySDKError(apiErr)
+	assert.True(t, shouldRetry)
+	assert.Contains(t, err.Error(), "server error (HTTP 503)")
+}
+
+func TestClassifySDKError_4xxNonRetryable(t *testing.T) {
+	t.Parallel()
+
+	apiErr := &openai.Error{
+		StatusCode: http.StatusUnauthorized,
+		Code:       "invalid_api_key",
+		Type:       "invalid_request_error",
+		Message:    "Invalid API key",
+	}
+
+	shouldRetry, err := classifySDKError(apiErr)
+	assert.False(t, shouldRetry)
+	assert.Contains(t, err.Error(), "HTTP 401")
+}
+
+func TestClassifySDKError_BadRequestNonRetryable(t *testing.T) {
+	t.Parallel()
+
+	apiErr := &openai.Error{
+		StatusCode: http.StatusBadRequest,
+		Code:       "bad_request",
+		Type:       "invalid_request_error",
+		Message:    "Bad request",
+	}
+
+	shouldRetry, err := classifySDKError(apiErr)
+	assert.False(t, shouldRetry)
+	assert.Contains(t, err.Error(), "HTTP 400")
+}
+
+func TestClassifySDKError_EOFRetryable(t *testing.T) {
+	t.Parallel()
+
+	shouldRetry, err := classifySDKError(io.EOF)
+	assert.True(t, shouldRetry)
+	assert.ErrorIs(t, err, errRetryable)
+	assert.Contains(t, err.Error(), "empty response body")
+}
+
+func TestClassifySDKError_UnexpectedEOFRetryable(t *testing.T) {
+	t.Parallel()
+
+	shouldRetry, err := classifySDKError(io.ErrUnexpectedEOF)
+	assert.True(t, shouldRetry)
+	assert.ErrorIs(t, err, errRetryable)
+	assert.Contains(t, err.Error(), "empty response body")
+}
+
+func TestClassifySDKError_JSONSyntaxErrorRetryable(t *testing.T) {
+	t.Parallel()
+
+	shouldRetry, err := classifySDKError(&json.SyntaxError{})
+	assert.True(t, shouldRetry)
+	assert.ErrorIs(t, err, errRetryable)
+	assert.Contains(t, err.Error(), "malformed JSON response")
+}
+
+func TestClassifySDKError_NetworkErrorNonRetryable(t *testing.T) {
+	t.Parallel()
+
+	shouldRetry, err := classifySDKError(errors.New("connection refused"))
+	assert.False(t, shouldRetry)
+	assert.Contains(t, err.Error(), "connection refused")
 }
 
 // ─── parseDuration ────────────────────────────────────────────────────────────
@@ -542,6 +657,28 @@ func mockOpenAIServer(body map[string]interface{}) *httptest.Server {
 	}))
 }
 
+// mockOpenAIServerWithCode returns an httptest.Server that responds with a
+// specific HTTP status code and body.
+func mockOpenAIServerWithCode(statusCode int, body interface{}) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		if body != nil {
+			_ = json.NewEncoder(w).Encode(body)
+		}
+	}))
+}
+
+// mockEmptyBodyServer returns an httptest.Server that responds with HTTP 200
+// and an empty body.
+func mockEmptyBodyServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// Write nothing — empty body.
+	}))
+}
+
 func openAITextBody(content string) map[string]interface{} {
 	return map[string]interface{}{
 		"id": "chatcmpl-test", "object": "chat.completion", "created": 1234567890, "model": "gpt-4o",
@@ -757,6 +894,146 @@ func TestSendToModel_ServerError(t *testing.T) {
 	assert.Nil(t, msg, "no message should be sent for retryable server errors")
 }
 
+// ─── sendToModel empty / blank response handling ────────────────────────────
+
+func TestSendToModel_EmptyChoicesWithoutError(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// HTTP 200 with empty choices and no error field.
+	body := map[string]interface{}{
+		"id": "chatcmpl-test", "object": "chat.completion", "created": 1234567890, "model": "gpt-4o",
+		"choices": []interface{}{},
+		"usage":   map[string]interface{}{},
+	}
+	ts := mockOpenAIServer(body)
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, nil)
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// This should send an error to the session (no panic).
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "no choices")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
+}
+
+func TestSendToModel_EmptyResponseBody(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// HTTP 200 with completely empty body (no content at all).
+	ts := mockEmptyBodyServer()
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	// Empty body is retryable; all retries exhausted silently.
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	outWriter.Close()
+	msg := tryFetchMessage(outReader)
+	assert.Nil(t, msg, "no message for retryable empty body errors after exhaustion")
+}
+
+// ─── sendToModel SDK HTTP error handling ────────────────────────────────────
+
+func TestSendToModel_HTTPServerErrorRetryThenSucceed(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// Server responds with HTTP 500 on first call, then 200 on retry.
+	var callCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(callCount.Add(1))
+		w.Header().Set("Content-Type", "application/json")
+
+		if n == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": map[string]interface{}{
+					"code":    "internal_error",
+					"message": "Server error",
+					"type":    "server_error",
+				},
+			})
+		} else {
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(openAITextBody("Success after 500!"))
+		}
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		payloadMap := result.Payload.(map[string]interface{})
+		msgMap := payloadMap["message"].(map[string]interface{})
+		assert.Equal(t, "Success after 500!", msgMap["content"])
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for success after HTTP 500 retry")
+	}
+}
+
+func TestSendToModel_HTTPClientErrorNonRetryable(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// Server responds with HTTP 401 (auth error).
+	ts := mockOpenAIServerWithCode(http.StatusUnauthorized, map[string]interface{}{
+		"error": map[string]interface{}{
+			"code":    "invalid_api_key",
+			"message": "Invalid API key",
+			"type":    "invalid_request_error",
+		},
+	})
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, nil)
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "HTTP 401")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
+}
+
+// ─── sendToModel context cancellation during retry ──────────────────────────
+
 // ─── sendToModel retry integration ────────────────────────────────────────────
 
 // counterServer returns an httptest.Server that alternates responses based on
@@ -830,6 +1107,44 @@ func TestSendToModel_RetryAllExhausted(t *testing.T) {
 	outWriter.Close()
 	msg := tryFetchMessage(outReader)
 	assert.Nil(t, msg, "no message should be sent when all retries are exhausted")
+}
+
+// ─── sendToModel non-retryable doesn't retry ────────────────────────────────
+
+func TestSendToModel_NonRetryableErrorNoRetry(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// Count how many times the server is called.
+	var callCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openAIErrorBody("invalid_api_key", "Invalid API key.", "invalid_request_error"))
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "10ms",
+		"retry_max_delay":     "100ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "error", result.Labels["status"])
+		// Should have only been called once (no retry).
+		assert.Equal(t, int32(1), callCount.Load())
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 }
 
 // ─── streaming sendToModel ─────────────────────────────────────────────────────
@@ -1096,6 +1411,72 @@ func TestSendToModel_StreamingInvalidAuthError(t *testing.T) {
 	}
 }
 
+// ─── sendToModel streaming with SSE error events ────────────────────────────
+
+func TestSendToModel_StreamingEmptyChoicesNoError(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// Stream that returns no choices and no error in the accumulated result.
+	chunks := []map[string]interface{}{
+		// A chunk with no choices (just usage data)
+		{
+			"id": "id1", "object": "chat.completion.chunk", "created": 1234567890, "model": "gpt-4o",
+			"choices": []interface{}{},
+		},
+	}
+	ts := mockSSEServer(chunks)
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, nil)
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "empty_response")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
+}
+
+func TestSendToModel_StreamingSSEErrorEvent(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// This test simulates an SSE error event (not a data: line with error JSON)
+	// by sending an event: error line with error data.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		// Send an error event with rate limit error data.
+		errBody, _ := json.Marshal(openAIErrorBody("rate_limit_exceeded", "Rate limit.", "requests"))
+		fmt.Fprintf(w, "event: error\ndata: %s\n\n", errBody)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, nil)
+	defer outWriter.Close()
+
+	// With retry_max_attempts=1, this is retryable but exhausted silently.
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+
+	outWriter.Close()
+	msg := tryFetchMessage(outReader)
+	assert.Nil(t, msg, "no message should be sent for retryable SSE error event")
+}
+
 // ─── sendToModel streaming retry integration ─────────────────────────────────
 
 func TestSendToModel_StreamingRetryThenSucceed(t *testing.T) {
@@ -1179,4 +1560,86 @@ func TestSendToModel_StreamingRetryThenSucceed(t *testing.T) {
 	msgMap := payloadMap["message"].(map[string]interface{})
 	assert.True(t, msgMap["is_complete"].(bool))
 	assert.Contains(t, msgMap["content"], "Hello after retry!")
+}
+
+func TestSendToModel_StreamingMaxRetriesExhausted(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// All connections return rate limit error.
+	var connectCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connectCount.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		errBody, _ := json.Marshal(openAIErrorBody("rate_limit_exceeded", "Rate limit.", "requests"))
+		fmt.Fprintf(w, "data: %s\n\n", errBody)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+
+	outWriter.Close()
+	msg := tryFetchMessage(outReader)
+	assert.Nil(t, msg, "no message should be sent when all streaming retries exhausted")
+	assert.Equal(t, int32(3), connectCount.Load(), "should have attempted 3 times")
+}
+
+func TestSendToModel_StreamingNonRetryableNoRetry(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	var connectCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connectCount.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		errBody, _ := json.Marshal(openAIErrorBody("invalid_api_key", "Invalid API key.", "invalid_request_error"))
+		fmt.Fprintf(w, "data: %s\n\n", errBody)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "10ms",
+		"retry_max_delay":     "100ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "invalid_api_key")
+		// Should have only been called once (no retry).
+		assert.Equal(t, int32(1), connectCount.Load())
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 }
