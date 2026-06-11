@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	agentpkg "github.com/honeydipper/honeydipper/v4/pkg/agent"
 	"github.com/honeydipper/honeydipper/v4/pkg/dipper"
@@ -29,6 +30,15 @@ func TestMain(m *testing.M) {
 		dipper.GetLogger("test service", "DEBUG", f, f)
 	}
 	os.Exit(m.Run())
+}
+
+// tryFetchMessage attempts to read one message from the pipe, recovering from
+// the EOF panic that dipper.FetchMessage raises when the writer is closed with
+// no data.  Returns nil when no message was produced.
+func tryFetchMessage(r io.Reader) (msg *dipper.Message) {
+	defer func() { recover() }() //nolint:errcheck // EOF panics are expected
+
+	return dipper.FetchMessage(r)
 }
 
 // ─── extractAPIError ──────────────────────────────────────────────────────────
@@ -453,12 +463,12 @@ func TestSendToModel_RateLimitError(t *testing.T) {
 	defer outWriter.Close()
 
 	// sendToModel should log the error and return without sending any message.
-	// No message means the session will see a channel close and can retry.
 	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
 
-	// The pipe should be closed now (driver wrote nothing), verify no message.
+	// No message should have been sent; FetchMessage would panic on EOF so use
+	// tryFetchMessage which recovers and returns nil.
 	outWriter.Close()
-	msg := dipper.FetchMessage(outReader)
+	msg := tryFetchMessage(outReader)
 	assert.Nil(t, msg, "no message should be sent for retryable errors")
 }
 
@@ -478,13 +488,17 @@ func TestSendToModel_InvalidRequestError(t *testing.T) {
 	// This should panic (caught by defer) and send an error message to the session.
 	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
 
-	result := <-done
-	require.NotNil(t, result)
-	assert.Equal(t, "agentbus", result.Channel)
-	assert.Equal(t, "receive", result.Subject)
-	assert.Equal(t, "sess-test", result.Labels["agent_session_id"])
-	assert.Equal(t, "error", result.Labels["status"])
-	assert.Contains(t, result.Labels["reason"], "invalid_api_key")
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "sess-test", result.Labels["agent_session_id"])
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "invalid_api_key")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 }
 
 func TestSendToModel_ServerError(t *testing.T) {
@@ -501,7 +515,7 @@ func TestSendToModel_ServerError(t *testing.T) {
 	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
 
 	outWriter.Close()
-	msg := dipper.FetchMessage(outReader)
+	msg := tryFetchMessage(outReader)
 	assert.Nil(t, msg, "no message should be sent for retryable server errors")
 }
 
@@ -741,7 +755,7 @@ func TestSendToModel_StreamingRateLimitError(t *testing.T) {
 	})
 
 	outWriter.Close()
-	msg := dipper.FetchMessage(outReader)
+	msg := tryFetchMessage(outReader)
 	assert.Nil(t, msg, "no message should be sent for retryable streaming errors")
 }
 
@@ -775,10 +789,14 @@ func TestSendToModel_StreamingInvalidAuthError(t *testing.T) {
 		})
 	})
 
-	result := <-done
-	require.NotNil(t, result)
-	assert.Equal(t, "agentbus", result.Channel)
-	assert.Equal(t, "receive", result.Subject)
-	assert.Equal(t, "error", result.Labels["status"])
-	assert.Contains(t, result.Labels["reason"], "invalid_api_key")
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "invalid_api_key")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 }
