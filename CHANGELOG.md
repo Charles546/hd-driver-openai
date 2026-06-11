@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/Charles546/hd-driver-openai/compare/v1.2.0...v1.3.0) (2026-06-11)
+
+
+### Features
+
+* enhanced error handling with SDK error differentiation and empty body retry ([#10](https://github.com/Charles546/hd-driver-openai/issues/10)) ([b15f0e4](https://github.com/Charles546/hd-driver-openai/commit/b15f0e4b916cfcbf9d8bc2d35b0652471a48e8dc))
+
 # [1.2.0](https://github.com/Charles546/hd-driver-openai/compare/v1.1.3...v1.2.0) (2026-06-11)
 
 
