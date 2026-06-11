@@ -7,12 +7,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,6 +41,98 @@ func tryFetchMessage(r io.Reader) (msg *dipper.Message) {
 	defer func() { _ = recover() }()
 
 	return dipper.FetchMessage(r)
+}
+
+// defaultEngineConfig is the minimal engine options used by most tests.  It
+// sets retry_max_attempts to 1 so that retryable-error tests don't hang.
+var defaultEngineConfig = map[string]interface{}{
+	"model":              "gpt-4o",
+	"api_key":            "test-key",
+	"retry_max_attempts": 1,
+}
+
+// ─── extractAPIErrorInfo ───────────────────────────────────────────────────────
+
+func TestExtractAPIErrorInfo_NoError(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"id":"chatcmpl-abc","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}]}`
+	info := extractAPIErrorInfo(raw)
+	assert.Nil(t, info)
+}
+
+func TestExtractAPIErrorInfo_RateLimit(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"error":{"code":"rate_limit_exceeded","message":"Rate limit exceeded.","type":"requests"}}`
+	info := extractAPIErrorInfo(raw)
+	require.NotNil(t, info)
+	assert.Equal(t, "rate_limit_exceeded", info.Code)
+	assert.Equal(t, "Rate limit exceeded.", info.Message)
+	assert.Equal(t, "requests", info.Type)
+	assert.True(t, info.Retryable)
+	assert.Equal(t, time.Duration(0), info.RetryAfter)
+}
+
+func TestExtractAPIErrorInfo_RateLimitWithRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"error":{"code":"rate_limit_exceeded","message":"Rate limit","type":"requests","retry_after":20}}`
+	info := extractAPIErrorInfo(raw)
+	require.NotNil(t, info)
+	assert.True(t, info.Retryable)
+	assert.Equal(t, 20*time.Second, info.RetryAfter)
+}
+
+func TestExtractAPIErrorInfo_FractionalRetryAfter(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"error":{"code":"rate_limit_exceeded","message":"Rate limit","type":"requests","retry_after":2.5}}`
+	info := extractAPIErrorInfo(raw)
+	require.NotNil(t, info)
+	assert.True(t, info.Retryable)
+	assert.Equal(t, 2500*time.Millisecond, info.RetryAfter)
+}
+
+func TestExtractAPIErrorInfo_InsufficientQuota(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"error":{"code":"insufficient_quota","message":"Quota exceeded.","type":"requests"}}`
+	info := extractAPIErrorInfo(raw)
+	require.NotNil(t, info)
+	assert.True(t, info.Retryable)
+}
+
+func TestExtractAPIErrorInfo_ServerError(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"error":{"code":"internal_error","message":"Server error.","type":"server_error"}}`
+	info := extractAPIErrorInfo(raw)
+	require.NotNil(t, info)
+	assert.True(t, info.Retryable)
+}
+
+func TestExtractAPIErrorInfo_InvalidRequest(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"error":{"code":"invalid_api_key","message":"Invalid API key.","type":"invalid_request_error"}}`
+	info := extractAPIErrorInfo(raw)
+	require.NotNil(t, info)
+	assert.False(t, info.Retryable)
+}
+
+func TestExtractAPIErrorInfo_InvalidJSON(t *testing.T) {
+	t.Parallel()
+
+	info := extractAPIErrorInfo(`not-json`)
+	assert.Nil(t, info)
+}
+
+func TestExtractAPIErrorInfo_EmptyJSON(t *testing.T) {
+	t.Parallel()
+
+	info := extractAPIErrorInfo(`{}`)
+	assert.Nil(t, info)
 }
 
 // ─── extractAPIError ──────────────────────────────────────────────────────────
@@ -125,6 +219,146 @@ func TestExtractAPIError_EmptyJSON(t *testing.T) {
 	assert.Empty(t, msg)
 	assert.Empty(t, errType)
 	assert.False(t, retryable)
+}
+
+// ─── parseDuration ────────────────────────────────────────────────────────────
+
+func TestParseDuration(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, 1*time.Second, parseDuration("", 1*time.Second))
+	assert.Equal(t, 1*time.Second, parseDuration("1s", 5*time.Second))
+	assert.Equal(t, 500*time.Millisecond, parseDuration("500ms", 1*time.Second))
+	assert.Equal(t, 2*time.Minute, parseDuration("2m", 1*time.Second))
+	// Invalid string returns default.
+	assert.Equal(t, 1*time.Second, parseDuration("not-a-duration", 1*time.Second))
+}
+
+// ─── calculateBackoff ─────────────────────────────────────────────────────────
+
+func TestCalculateBackoff_FirstAttempt(t *testing.T) {
+	t.Parallel()
+
+	// Fixed seed for reproducibility.
+	delay := calculateBackoff(1, 1*time.Second, 30*time.Second, nil)
+	assert.GreaterOrEqual(t, delay, 1*time.Second)
+	assert.LessOrEqual(t, delay, 1250*time.Millisecond) // 1s + 25% jitter
+}
+
+func TestCalculateBackoff_SecondAttempt(t *testing.T) {
+	t.Parallel()
+
+	delay := calculateBackoff(2, 1*time.Second, 30*time.Second, nil)
+	assert.GreaterOrEqual(t, delay, 2*time.Second)
+	assert.LessOrEqual(t, delay, 2500*time.Millisecond) // 2s + 25% jitter
+}
+
+func TestCalculateBackoff_CapsAtMax(t *testing.T) {
+	t.Parallel()
+
+	delay := calculateBackoff(10, 1*time.Second, 5*time.Second, nil)
+	assert.GreaterOrEqual(t, delay, 5*time.Second)
+	assert.LessOrEqual(t, delay, 6250*time.Millisecond) // 5s + 25% jitter
+}
+
+func TestCalculateBackoff_RetryAfter(t *testing.T) {
+	t.Parallel()
+
+	info := &apiErrorInfo{RetryAfter: 3 * time.Second}
+	// With initial delay 1s, attempt 2 would give 2s exponential, but
+	// Retry-After 3s should override.
+	delay := calculateBackoff(2, 1*time.Second, 30*time.Second, info)
+	assert.GreaterOrEqual(t, delay, 3*time.Second)
+}
+
+func TestCalculateBackoff_RetryAfterShorter(t *testing.T) {
+	t.Parallel()
+
+	info := &apiErrorInfo{RetryAfter: 1 * time.Second}
+	// Attempt 4 would give 8s exponential, so Retry-After 1s shouldn't override.
+	delay := calculateBackoff(4, 1*time.Second, 30*time.Second, info)
+	assert.GreaterOrEqual(t, delay, 8*time.Second)
+}
+
+// ─── retryWithBackoff ─────────────────────────────────────────────────────────
+
+func TestRetryWithBackoff_FirstAttemptSucceeds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	attempts := 0
+
+	err := retryWithBackoff(ctx, 3, 10*time.Millisecond, 100*time.Millisecond, func() (bool, error) {
+		attempts++
+
+		return false, nil
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, 1, attempts)
+}
+
+func TestRetryWithBackoff_SecondAttemptSucceeds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	attempts := 0
+
+	err := retryWithBackoff(ctx, 3, 10*time.Millisecond, 100*time.Millisecond, func() (bool, error) {
+		attempts++
+		if attempts == 1 {
+			return true, fmt.Errorf("transient error")
+		}
+
+		return false, nil
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, 2, attempts)
+}
+
+func TestRetryWithBackoff_AllAttemptsExhausted(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	attempts := 0
+
+	err := retryWithBackoff(ctx, 3, 10*time.Millisecond, 100*time.Millisecond, func() (bool, error) {
+		attempts++
+
+		return true, fmt.Errorf("persistent error")
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "all 3 retry attempts exhausted")
+	assert.Equal(t, 3, attempts)
+}
+
+func TestRetryWithBackoff_ContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts := 0
+
+	// Start the retry loop in a goroutine because it will block on the backoff.
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- retryWithBackoff(ctx, 3, 5*time.Second, 30*time.Second, func() (bool, error) {
+			attempts++
+
+			return true, fmt.Errorf("transient error")
+		})
+	}()
+
+	// Wait for the first attempt to complete.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	err := <-errCh
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, attempts)
 }
 
 // ─── buildMessages ────────────────────────────────────────────────────────────
@@ -349,17 +583,22 @@ func openAIErrorBody(errCode, errMsg, errType string) map[string]interface{} {
 	}
 }
 
-func setupDriverWithServer(ts *httptest.Server) (io.Reader, *io.PipeWriter) {
+func setupDriverWithServer(ts *httptest.Server, extraEngineOpts map[string]interface{}) (io.Reader, *io.PipeWriter) {
 	outReader, outWriter := io.Pipe()
+	engineOpts := make(map[string]interface{})
+	for k, v := range defaultEngineConfig {
+		engineOpts[k] = v
+	}
+	for k, v := range extraEngineOpts {
+		engineOpts[k] = v
+	}
+	engineOpts["base_url"] = ts.URL + "/"
+
 	driver = &dipper.Driver{
 		Options: map[string]interface{}{
 			"data": map[string]interface{}{
 				"engines": map[string]interface{}{
-					"test-engine": map[string]interface{}{
-						"model":    "gpt-4o",
-						"api_key":  "test-key",
-						"base_url": ts.URL + "/",
-					},
+					"test-engine": engineOpts,
 				},
 			},
 		},
@@ -385,7 +624,7 @@ func TestSendToModel_TextResponse(t *testing.T) {
 	ts := mockOpenAIServer(openAITextBody("Hello, test!"))
 	defer ts.Close()
 
-	outReader, outWriter := setupDriverWithServer(ts)
+	outReader, outWriter := setupDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
 	done := make(chan *dipper.Message, 1)
@@ -412,7 +651,7 @@ func TestSendToModel_ToolCallResponse(t *testing.T) {
 	ts := mockOpenAIServer(openAIToolCallBody("search_web", `{"query":"golang testing"}`))
 	defer ts.Close()
 
-	outReader, outWriter := setupDriverWithServer(ts)
+	outReader, outWriter := setupDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
 	done := make(chan *dipper.Message, 1)
@@ -459,14 +698,13 @@ func TestSendToModel_RateLimitError(t *testing.T) {
 	ts := mockOpenAIServer(openAIErrorBody("rate_limit_exceeded", "Rate limit exceeded.", "requests"))
 	defer ts.Close()
 
-	outReader, outWriter := setupDriverWithServer(ts)
+	outReader, outWriter := setupDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
-	// sendToModel should log the error and return without sending any message.
+	// With retry_max_attempts=1, the server returns an error, the retry loop
+	// exhausts all attempts (just one) and returns silently.
 	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
 
-	// No message should have been sent; FetchMessage would panic on EOF so use
-	// tryFetchMessage which recovers and returns nil.
 	outWriter.Close()
 	msg := tryFetchMessage(outReader)
 	assert.Nil(t, msg, "no message should be sent for retryable errors")
@@ -479,7 +717,7 @@ func TestSendToModel_InvalidRequestError(t *testing.T) {
 	ts := mockOpenAIServer(openAIErrorBody("invalid_api_key", "Invalid API key.", "invalid_request_error"))
 	defer ts.Close()
 
-	outReader, outWriter := setupDriverWithServer(ts)
+	outReader, outWriter := setupDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
 	done := make(chan *dipper.Message, 1)
@@ -508,15 +746,90 @@ func TestSendToModel_ServerError(t *testing.T) {
 	ts := mockOpenAIServer(openAIErrorBody("internal_error", "Server error.", "server_error"))
 	defer ts.Close()
 
-	outReader, outWriter := setupDriverWithServer(ts)
+	outReader, outWriter := setupDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
-	// Server errors are retryable; no message should be sent.
+	// Server errors are retryable; with retry_max_attempts=1, no message sent.
 	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
 
 	outWriter.Close()
 	msg := tryFetchMessage(outReader)
 	assert.Nil(t, msg, "no message should be sent for retryable server errors")
+}
+
+// ─── sendToModel retry integration ────────────────────────────────────────────
+
+// counterServer returns an httptest.Server that alternates responses based on
+// a request counter.  The fn receives the current count (1-based) and returns
+// the response body for that request.
+func counterServer(fn func(n int) map[string]interface{}) *httptest.Server {
+	var counter atomic.Int32
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(counter.Add(1))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(fn(n))
+	}))
+}
+
+func TestSendToModel_RetryThenSucceed(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	ts := counterServer(func(n int) map[string]interface{} {
+		if n == 1 {
+			return openAIErrorBody("rate_limit_exceeded", "Rate limit.", "requests")
+		}
+
+		return openAITextBody("Success on retry!")
+	})
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "10ms",
+		"retry_max_delay":     "100ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		payloadMap, ok := result.Payload.(map[string]interface{})
+		require.True(t, ok)
+		msgMap, ok := payloadMap["message"].(map[string]interface{})
+		require.True(t, ok)
+		assert.Equal(t, "Success on retry!", msgMap["content"])
+		assert.True(t, msgMap["is_complete"].(bool))
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for successful response after retry")
+	}
+}
+
+func TestSendToModel_RetryAllExhausted(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// Server always returns rate limit error.
+	ts := mockOpenAIServer(openAIErrorBody("rate_limit_exceeded", "Always rate limited.", "requests"))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "5ms",
+		"retry_max_delay":     "50ms",
+	})
+	defer outWriter.Close()
+
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	// No message should be sent — all retries exhausted silently.
+	outWriter.Close()
+	msg := tryFetchMessage(outReader)
+	assert.Nil(t, msg, "no message should be sent when all retries are exhausted")
 }
 
 // ─── streaming sendToModel ─────────────────────────────────────────────────────
@@ -543,7 +856,7 @@ func mockSSEServer(chunks []map[string]interface{}) *httptest.Server {
 	}))
 }
 
-func streamingChunk(id, content, finishReason string) map[string]interface{} {
+func streamingChunk(content, finishReason string) map[string]interface{} {
 	delta := map[string]interface{}{"role": "assistant", "content": content}
 	choice := map[string]interface{}{"index": 0, "delta": delta}
 
@@ -552,12 +865,12 @@ func streamingChunk(id, content, finishReason string) map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"id": id, "object": "chat.completion.chunk", "created": 1234567890, "model": "gpt-4o",
+		"id": "id1", "object": "chat.completion.chunk", "created": 1234567890, "model": "gpt-4o",
 		"choices": []interface{}{choice},
 	}
 }
 
-func streamingToolCallChunk(id, toolID, toolName, args, finishReason string) map[string]interface{} {
+func streamingToolCallChunk(toolID, toolName, args, finishReason string) map[string]interface{} {
 	toolCall := map[string]interface{}{
 		"index": 0, "id": toolID, "type": "function",
 		"function": map[string]interface{}{"name": toolName, "arguments": args},
@@ -570,22 +883,27 @@ func streamingToolCallChunk(id, toolID, toolName, args, finishReason string) map
 	}
 
 	return map[string]interface{}{
-		"id": id, "object": "chat.completion.chunk", "created": 1234567890, "model": "gpt-4o",
+		"id": "id2", "object": "chat.completion.chunk", "created": 1234567890, "model": "gpt-4o",
 		"choices": []interface{}{choice},
 	}
 }
 
-func setupStreamingDriverWithServer(ts *httptest.Server) (io.Reader, *io.PipeWriter) {
+func setupStreamingDriverWithServer(ts *httptest.Server, extraEngineOpts map[string]interface{}) (io.Reader, *io.PipeWriter) {
 	outReader, outWriter := io.Pipe()
+	engineOpts := make(map[string]interface{})
+	for k, v := range defaultEngineConfig {
+		engineOpts[k] = v
+	}
+	for k, v := range extraEngineOpts {
+		engineOpts[k] = v
+	}
+	engineOpts["base_url"] = ts.URL + "/"
+
 	driver = &dipper.Driver{
 		Options: map[string]interface{}{
 			"data": map[string]interface{}{
 				"engines": map[string]interface{}{
-					"stream-engine": map[string]interface{}{
-						"model":    "gpt-4o",
-						"api_key":  "test-key",
-						"base_url": ts.URL + "/",
-					},
+					"stream-engine": engineOpts,
 				},
 			},
 		},
@@ -595,16 +913,29 @@ func setupStreamingDriverWithServer(ts *httptest.Server) (io.Reader, *io.PipeWri
 	return outReader, outWriter
 }
 
+func streamingMessage() *dipper.Message {
+	return &dipper.Message{
+		Channel: "rpc",
+		Subject: "send_to_model",
+		Labels:  map[string]string{"agent_session_id": "sess-stream"},
+		Payload: map[string]interface{}{
+			"engine":        "stream-engine",
+			"history":       []interface{}{},
+			"should_stream": true,
+		},
+	}
+}
+
 func TestSendToModel_StreamingTextResponse(t *testing.T) {
 	chunks := []map[string]interface{}{
-		streamingChunk("id1", "Hello", ""),
-		streamingChunk("id1", ", world", ""),
-		streamingChunk("id1", "", "stop"),
+		streamingChunk("Hello", ""),
+		streamingChunk(", world", ""),
+		streamingChunk("", "stop"),
 	}
 	ts := mockSSEServer(chunks)
 	defer ts.Close()
 
-	outReader, outWriter := setupStreamingDriverWithServer(ts)
+	outReader, outWriter := setupStreamingDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
 	// Collect all messages until the writer is closed.  FetchMessage panics on EOF
@@ -638,16 +969,7 @@ func TestSendToModel_StreamingTextResponse(t *testing.T) {
 		}
 	}()
 
-	sendToModel(&dipper.Message{
-		Channel: "rpc",
-		Subject: "send_to_model",
-		Labels:  map[string]string{"agent_session_id": "sess-stream"},
-		Payload: map[string]interface{}{
-			"engine":        "stream-engine",
-			"history":       []interface{}{},
-			"should_stream": true,
-		},
-	})
+	sendToModel(streamingMessage())
 
 	outWriter.Close()
 	<-done
@@ -671,28 +993,19 @@ func TestSendToModel_StreamingTextResponse(t *testing.T) {
 
 func TestSendToModel_StreamingToolCallResponse(t *testing.T) {
 	chunks := []map[string]interface{}{
-		streamingToolCallChunk("id2", "call_xyz", "search_web", `{"query":"go testing"}`, ""),
-		streamingToolCallChunk("id2", "", "", "", "tool_calls"),
+		streamingToolCallChunk("call_xyz", "search_web", `{"query":"go testing"}`, ""),
+		streamingToolCallChunk("", "", "", "tool_calls"),
 	}
 	ts := mockSSEServer(chunks)
 	defer ts.Close()
 
-	outReader, outWriter := setupStreamingDriverWithServer(ts)
+	outReader, outWriter := setupStreamingDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
 	done := make(chan *dipper.Message, 1)
 	go func() { done <- dipper.FetchMessage(outReader) }()
 
-	sendToModel(&dipper.Message{
-		Channel: "rpc",
-		Subject: "send_to_model",
-		Labels:  map[string]string{"agent_session_id": "sess-tool-stream"},
-		Payload: map[string]interface{}{
-			"engine":        "stream-engine",
-			"history":       []interface{}{},
-			"should_stream": true,
-		},
-	})
+	sendToModel(streamingMessage())
 
 	result := <-done
 	require.NotNil(t, result)
@@ -737,21 +1050,12 @@ func TestSendToModel_StreamingRateLimitError(t *testing.T) {
 	ts := mockSSEServer(chunks)
 	defer ts.Close()
 
-	outReader, outWriter := setupStreamingDriverWithServer(ts)
+	outReader, outWriter := setupStreamingDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
-	// Retryable: should return without sending any message.
+	// Retryable: with retry_max_attempts=1, should return without sending any message.
 	assert.NotPanics(t, func() {
-		sendToModel(&dipper.Message{
-			Channel: "rpc",
-			Subject: "send_to_model",
-			Labels:  map[string]string{"agent_session_id": "sess-stream-rate"},
-			Payload: map[string]interface{}{
-				"engine":        "stream-engine",
-				"history":       []interface{}{},
-				"should_stream": true,
-			},
-		})
+		sendToModel(streamingMessage())
 	})
 
 	outWriter.Close()
@@ -769,7 +1073,7 @@ func TestSendToModel_StreamingInvalidAuthError(t *testing.T) {
 	ts := mockSSEServer(chunks)
 	defer ts.Close()
 
-	outReader, outWriter := setupStreamingDriverWithServer(ts)
+	outReader, outWriter := setupStreamingDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
 	done := make(chan *dipper.Message, 1)
@@ -777,16 +1081,7 @@ func TestSendToModel_StreamingInvalidAuthError(t *testing.T) {
 
 	// Non-retryable: should send an error message to the session via deferred recovery.
 	assert.NotPanics(t, func() {
-		sendToModel(&dipper.Message{
-			Channel: "rpc",
-			Subject: "send_to_model",
-			Labels:  map[string]string{"agent_session_id": "sess-stream-auth"},
-			Payload: map[string]interface{}{
-				"engine":        "stream-engine",
-				"history":       []interface{}{},
-				"should_stream": true,
-			},
-		})
+		sendToModel(streamingMessage())
 	})
 
 	select {
@@ -799,4 +1094,89 @@ func TestSendToModel_StreamingInvalidAuthError(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for error message")
 	}
+}
+
+// ─── sendToModel streaming retry integration ─────────────────────────────────
+
+func TestSendToModel_StreamingRetryThenSucceed(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	// A counter server that returns an error on the first connection and a
+	// successful stream on subsequent connections.
+	var connectCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(connectCount.Add(1))
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		if n == 1 {
+			// First connection: return a rate-limit error.
+			errBody, _ := json.Marshal(openAIErrorBody("rate_limit_exceeded", "Rate limit.", "requests"))
+			fmt.Fprintf(w, "data: %s\n\n", errBody)
+		} else {
+			// Subsequent connections: return a successful streaming response.
+			chunk1, _ := json.Marshal(streamingChunk("Hello after retry!", ""))
+			fmt.Fprintf(w, "data: %s\n\n", chunk1)
+			chunk2, _ := json.Marshal(streamingChunk("", "stop"))
+			fmt.Fprintf(w, "data: %s\n\n", chunk2)
+		}
+
+		fmt.Fprint(w, "data: [DONE]\n\n")
+
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "10ms",
+		"retry_max_delay":     "100ms",
+	})
+	defer outWriter.Close()
+
+	// Collect all messages.
+	var msgs []*dipper.Message
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for {
+			var m *dipper.Message
+			var panicked bool
+
+			func() {
+				defer func() {
+					if recover() != nil {
+						panicked = true
+					}
+				}()
+
+				m = dipper.FetchMessage(outReader)
+			}()
+
+			if panicked || m == nil {
+				return
+			}
+
+			msgs = append(msgs, m)
+		}
+	}()
+
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+	outWriter.Close()
+	<-done
+
+	require.GreaterOrEqual(t, len(msgs), 1, "expected at least one message after streaming retry")
+
+	last := msgs[len(msgs)-1]
+	payloadMap := last.Payload.(map[string]interface{})
+	msgMap := payloadMap["message"].(map[string]interface{})
+	assert.True(t, msgMap["is_complete"].(bool))
+	assert.Contains(t, msgMap["content"], "Hello after retry!")
 }

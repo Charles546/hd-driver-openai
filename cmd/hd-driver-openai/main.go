@@ -15,7 +15,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
+	"math/rand/v2"
 	"strings"
+	"time"
 
 	agentpkg "github.com/honeydipper/honeydipper/v4/pkg/agent"
 	"github.com/honeydipper/honeydipper/v4/pkg/dipper"
@@ -34,7 +37,38 @@ type engineConfig struct {
 	Model   string `mapstructure:"model"`
 	APIKey  string `mapstructure:"api_key"`
 	BaseURL string `mapstructure:"base_url"`
+
+	// Retry configuration for transient API errors (e.g. 429 rate limit).
+	RetryMaxAttempts  int    `mapstructure:"retry_max_attempts"`
+	RetryInitialDelay string `mapstructure:"retry_initial_delay"`
+	RetryMaxDelay     string `mapstructure:"retry_max_delay"`
 }
+
+// apiErrorInfo holds structured information about an API error detected in a
+// response body (typically returned as HTTP 200 with an "error" JSON object).
+type apiErrorInfo struct {
+	Code       string
+	Message    string
+	Type       string
+	Retryable  bool
+	RetryAfter time.Duration // suggested delay from the response (0 if not set)
+}
+
+// errRetryable is a static sentinel that wraps a retryable transient error.
+var errRetryable = errors.New("retryable API error")
+
+// errNonRetryable is a static sentinel for non-retryable API errors.
+var errNonRetryable = errors.New("non-retryable API error")
+
+// retryAfterError wraps a retryable error with an optional Retry-After hint.
+type retryAfterError struct {
+	Duration time.Duration
+	Err      error
+}
+
+func (e *retryAfterError) Error() string { return e.Err.Error() }
+
+func (e *retryAfterError) Unwrap() error { return e.Err }
 
 func main() {
 	flag.Parse()
@@ -47,6 +81,8 @@ func main() {
 // sendToModel is the RPC handler for send_to_model.  It decodes the payload,
 // calls the OpenAI chat-completions endpoint, and delivers the response back
 // to the agent session via the agentbus:receive channel.
+//
+//nolint:funlen // core orchestration function; splitting would reduce clarity.
 func sendToModel(msg *dipper.Message) {
 	msg = dipper.DeserializePayload(msg)
 
@@ -121,30 +157,69 @@ func sendToModel(msg *dipper.Message) {
 
 	client := newOpenAIClient(cfg)
 
+	// Parse retry configuration with sensible defaults.
+	retryMaxAttempts := cfg.RetryMaxAttempts
+	if retryMaxAttempts <= 0 {
+		retryMaxAttempts = 3
+	}
+
+	retryInitialDelay := parseDuration(cfg.RetryInitialDelay, 1*time.Second)
+	retryMaxDelay := parseDuration(cfg.RetryMaxDelay, 30*time.Second)
+
 	shouldStream, _ := dipper.GetMapDataBool(msg.Payload, "should_stream")
 	if shouldStream {
 		reqOpts = append(reqOpts, option.WithJSONSet("stream_options", map[string]interface{}{"include_usage": true}))
-		sendToModelStreaming(ctx, client, params, reqOpts, sessionID, reasoningExtraction)
+		sendToModelStreaming(ctx, client, params, reqOpts, sessionID, reasoningExtraction,
+			retryMaxAttempts, retryInitialDelay, retryMaxDelay)
 
 		return
 	}
 
-	completion := dipper.Must(client.Chat.Completions.New(ctx, params, reqOpts...)).(*openai.ChatCompletion)
+	// Non-streaming: retry loop for retryable API errors using exponential backoff.
+	var lastErrInfo *apiErrorInfo
 
-	// Check for API-level errors hidden in HTTP 200 responses (e.g. 429 rate limit).
-	// If an error was found and handled (retryable returns silently, non-retryable panics),
-	// stop processing.
-	if checkAndHandleAPIError(completion.RawJSON(), sessionID) {
-		return
+	err := retryWithBackoff(ctx, retryMaxAttempts, retryInitialDelay, retryMaxDelay, func() (bool, error) {
+		completion, err := client.Chat.Completions.New(ctx, params, reqOpts...)
+		if err != nil {
+			// SDK-level error (e.g. network, bad HTTP status >=400).
+			// Treat these as non-retryable to avoid masking serious issues.
+			return false, fmt.Errorf("API call failed: %w", err)
+		}
+
+		lastErrInfo = extractAPIErrorInfo(completion.RawJSON())
+		if lastErrInfo == nil {
+			// Success — no API error detected.
+			handleIncomingMessage(completion, sessionID, reasoningExtraction)
+
+			return false, nil
+		}
+
+		dipper.Logger.Warningf("[openai] API error (attempt) session=%s: code=%s type=%s message=%s",
+			sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+
+		if !lastErrInfo.Retryable {
+			return false, fmt.Errorf("%w: code=%s type=%s message=%s",
+				errNonRetryable, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+		}
+
+		// Retryable: return a retryAfterError with the optional Retry-After hint.
+		return true, &retryAfterError{
+			Duration: lastErrInfo.RetryAfter,
+			Err:      fmt.Errorf("%w: code=%s type=%s message=%s", errRetryable, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message),
+		}
+	})
+	if err != nil {
+		// Determine if the final error is retryable (exhausted) or non-retryable.
+		var retryErr *retryAfterError
+
+		if errors.As(err, &retryErr) {
+			// All retries exhausted.
+			dipper.Logger.Errorf("[openai] retry exhausted session=%s: %v", sessionID, err)
+		} else {
+			// Non-retryable: let the deferred recovery send an error to the session.
+			dipper.Logger.Panicf("[openai] non-retryable API error session=%s: %v", sessionID, err)
+		}
 	}
-
-	if len(completion.Choices) == 0 {
-		dipper.Logger.Panicf("[openai] send_to_model no choices returned session=%s", sessionID)
-
-		return
-	}
-
-	handleIncomingMessage(completion, sessionID, reasoningExtraction)
 }
 
 // agentbusMessage wraps an agent message in a dipper transport message for the agentbus receive channel.
@@ -160,87 +235,152 @@ func agentbusMessage(sessionID string, msg agentpkg.Message) *dipper.Message {
 	}
 }
 
-// extractAPIError inspects a raw JSON response body for an OpenAI API error
-// object.  It returns the error code, message, type, and whether the error is
-// considered retryable.  When no error is found, all return values are zero-valued.
+// extractAPIErrorInfo inspects a raw JSON response body for an OpenAI API error
+// object and returns structured error information.  Returns nil when no error
+// is present.
 //
-// Retryable errors include those with code "rate_limit_exceeded" (429) and
-// server-error types (5xx).  All other error codes (e.g. 400, 401, 403) are
-// treated as non-retryable.
-func extractAPIError(rawJSON string) (code, message, errType string, retryable bool) {
+// Retryable errors include those with code "rate_limit_exceeded" or
+// "insufficient_quota", and server-error types (5xx).  All other error codes
+// (e.g. 400, 401, 403) are treated as non-retryable.
+func extractAPIErrorInfo(rawJSON string) *apiErrorInfo {
 	if !gjson.Valid(rawJSON) {
-		return "", "", "", false
+		return nil
 	}
 
 	errVal := gjson.Get(rawJSON, "error")
 	if !errVal.Exists() {
-		return "", "", "", false
+		return nil
 	}
 
-	code = gjson.Get(rawJSON, "error.code").String()
-	message = gjson.Get(rawJSON, "error.message").String()
-	errType = gjson.Get(rawJSON, "error.type").String()
+	info := &apiErrorInfo{
+		Code:    gjson.Get(rawJSON, "error.code").String(),
+		Message: gjson.Get(rawJSON, "error.message").String(),
+		Type:    gjson.Get(rawJSON, "error.type").String(),
+	}
+
+	// Extract optional retry_after from the error body (seconds, may be fractional).
+	retryAfter := gjson.Get(rawJSON, "error.retry_after")
+	if retryAfter.Exists() {
+		info.RetryAfter = time.Duration(retryAfter.Float() * float64(time.Second))
+	}
 
 	// Rate-limit errors are retryable.
-	if code == "rate_limit_exceeded" || code == "insufficient_quota" {
-		return code, message, errType, true
+	if info.Code == "rate_limit_exceeded" || info.Code == "insufficient_quota" {
+		info.Retryable = true
+
+		return info
 	}
 
 	// Server-side error types (5xx-equivalent) are retryable.
-	if strings.HasPrefix(errType, "server_error") {
-		return code, message, errType, true
+	if strings.HasPrefix(info.Type, "server_error") {
+		info.Retryable = true
+
+		return info
 	}
 
 	// All other errors (e.g. invalid_request_error, 400, 401, 403) are not retryable.
-	return code, message, errType, false
+	return info
 }
 
-// checkAndHandleAPIError checks a raw JSON response for an OpenAI API error.
-// Returns true if an error was found and handled (halting normal processing).
-// For retryable errors it logs and silently returns true; for non-retryable
-// errors it panics (caught by the caller's deferred recovery, which sends an
-// error to the session). Returns false if no error was present.
-func checkAndHandleAPIError(rawJSON string, sessionID string) bool {
-	code, msg, errType, retryable := extractAPIError(rawJSON)
-	if code == "" {
-		return false
+// extractAPIError inspects a raw JSON response body for an OpenAI API error
+// object.  It returns the error code, message, type, and whether the error is
+// considered retryable.  When no error is found, all return values are zero-valued.
+//
+// Deprecated: Use extractAPIErrorInfo which returns structured error info
+// including the optional retry_after duration.
+func extractAPIError(rawJSON string) (code, message, errType string, retryable bool) {
+	info := extractAPIErrorInfo(rawJSON)
+	if info == nil {
+		return "", "", "", false
 	}
 
-	dipper.Logger.Errorf("[openai] API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
-	if retryable {
-		return true
-	}
-
-	dipper.Logger.Panicf("[openai] non-retryable API error session=%s: code=%s type=%s message=%s", sessionID, code, errType, msg)
-
-	return true // unreachable, but makes the linter happy
-}
-
-// handleStreamError checks a stream error for embedded API error data.
-// Returns true if the error was handled (retryable or non-retryable panic);
-// returns false if the error is not an API error and should be propagated.
-func handleStreamError(err error, sessionID string) bool {
-	var streamErr *ssestream.StreamError
-	if !errors.As(err, &streamErr) {
-		return false
-	}
-
-	return checkAndHandleAPIError(string(streamErr.Event.Data), sessionID)
+	return info.Code, info.Message, info.Type, info.Retryable
 }
 
 // sendToModelStreaming calls the OpenAI streaming endpoint, emits each content
 // delta as a non-complete agentbus message, and sends a final complete message
 // once the stream closes.  Tool-call responses are accumulated and sent as a
 // single tool message at the end.
+//
+// If a retryable API error is detected before any content has been streamed,
+// the function will retry the entire streaming request with exponential backoff.
 func sendToModelStreaming(ctx context.Context, client *openai.Client, params openai.ChatCompletionNewParams,
 	reqOpts []option.RequestOption, sessionID string, reasoningExtraction string,
+	retryMaxAttempts int, retryInitialDelay, retryMaxDelay time.Duration,
 ) {
+	var lastErrInfo *apiErrorInfo
+	contentDelivered := false
+
+	for attempt := 0; attempt < retryMaxAttempts; attempt++ {
+		if attempt > 0 {
+			// Only retry if no content was delivered yet.
+			if contentDelivered {
+				dipper.Logger.Errorf("[openai] streaming API error after content delivered session=%s: code=%s type=%s message=%s",
+					sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+
+				return
+			}
+
+			delay := calculateBackoff(attempt, retryInitialDelay, retryMaxDelay, lastErrInfo)
+
+			dipper.Logger.Infof("[openai] streaming retrying after %v (attempt %d/%d) session=%s",
+				delay, attempt+1, retryMaxAttempts, sessionID)
+
+			select {
+			case <-ctx.Done():
+				dipper.Logger.Panicf("[openai] context cancelled during streaming retry backoff session=%s", sessionID)
+
+				return
+
+			case <-time.After(delay):
+			}
+		}
+
+		contentDelivered, lastErrInfo = runStream(ctx, client, params, reqOpts, sessionID, reasoningExtraction)
+		if lastErrInfo == nil {
+			return // success
+		}
+
+		dipper.Logger.Warningf("[openai] streaming API error (attempt %d/%d) session=%s: code=%s type=%s message=%s",
+			attempt+1, retryMaxAttempts, sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+
+		if !lastErrInfo.Retryable || contentDelivered {
+			// Non-retryable error, or content was already delivered.
+			if !lastErrInfo.Retryable {
+				// Non-retryable: let the deferred recovery send an error to the session.
+				dipper.Logger.Panicf("[openai] non-retryable streaming API error session=%s: code=%s type=%s message=%s",
+					sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+			}
+
+			return
+		}
+
+		// Retryable error before any content — loop continues.
+	}
+
+	// All retries exhausted.
+	dipper.Logger.Errorf("[openai] streaming retry exhausted session=%s: code=%s type=%s message=%s",
+		sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+}
+
+// runStream performs a single streaming request and returns whether any content
+// was delivered and any API error info detected.  Returns nil error info on
+// success.
+func runStream(ctx context.Context, client *openai.Client, params openai.ChatCompletionNewParams,
+	reqOpts []option.RequestOption, sessionID string, reasoningExtraction string,
+) (contentDelivered bool, errInfo *apiErrorInfo) {
 	streamer := client.Chat.Completions.NewStreaming(ctx, params, reqOpts...)
 	acc := openai.ChatCompletionAccumulator{}
+	delivered := false
 
 	for streamer.Next() {
 		chunk := streamer.Current()
 		acc.AddChunk(chunk)
+
+		// Check for API error in the chunk data before proceeding.
+		if errInfo := extractAPIErrorInfo(chunk.RawJSON()); errInfo != nil {
+			return delivered, errInfo
+		}
 
 		// Tool calls are accumulated; skip content handling until the stream ends.
 		if _, ok := acc.JustFinishedToolCall(); ok {
@@ -255,7 +395,7 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 				IsComplete: true,
 			}))
 
-			return
+			return delivered, nil
 		}
 
 		if len(chunk.Choices) == 0 {
@@ -278,30 +418,45 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 		}
 
 		if len(msg.Thoughts) > 0 || len(msg.Content) > 0 {
+			delivered = true
 			driver.SendMessage(agentbusMessage(sessionID, msg))
 		}
 	}
 
 	// Check for stream-level errors (including API errors embedded in SSE events).
 	if err := streamer.Err(); err != nil {
-		if !handleStreamError(err, sessionID) {
+		var streamErr *ssestream.StreamError
+		if !errors.As(err, &streamErr) {
 			dipper.Must(err)
+
+			return delivered, nil
 		}
 
-		return
+		info := extractAPIErrorInfo(string(streamErr.Event.Data))
+		if info != nil {
+			return delivered, info
+		}
+
+		// Non-API stream error — propagate.
+		dipper.Must(err)
+
+		return delivered, nil
 	}
 
 	if len(acc.Choices) == 0 {
-		if checkAndHandleAPIError(acc.RawJSON(), sessionID) {
-			return
+		info := extractAPIErrorInfo(acc.RawJSON())
+		if info != nil {
+			return delivered, info
 		}
 
 		dipper.Logger.Panicf("[openai] streaming no choices returned session=%s", sessionID)
 
-		return
+		return delivered, nil
 	}
 
 	handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
+
+	return delivered, nil
 }
 
 // handleIncomingMessage processes a single OpenAI message from the streaming endpoint,
@@ -488,4 +643,112 @@ func buildToolCalls(toolCalls []openai.ChatCompletionMessageToolCallUnion) []age
 	}
 
 	return calls
+}
+
+// parseDuration parses a Go duration string (e.g. "1s", "500ms") or returns the
+// default if the string is empty or invalid.
+func parseDuration(s string, defaultVal time.Duration) time.Duration {
+	if s == "" {
+		return defaultVal
+	}
+
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		dipper.Logger.Warningf("[openai] invalid duration %q, using default %v", s, defaultVal)
+
+		return defaultVal
+	}
+
+	return d
+}
+
+// calculateBackoff computes the delay before the next retry attempt using
+// exponential backoff with jitter.  If the error response includes a
+// Retry-After hint, the delay will be at least that value.
+//
+//nolint:gosec // G404: math/rand/v2 is acceptable for jitter; cryptographic randomness is not required.
+func calculateBackoff(attempt int, initialDelay, maxDelay time.Duration, errInfo *apiErrorInfo) time.Duration {
+	// Compute exponential backoff: initialDelay * 2^(attempt-1)
+	delay := time.Duration(float64(initialDelay) * math.Pow(2, float64(attempt-1)))
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+
+	// Add jitter: 0-25% of the delay to avoid thundering herd.
+	jitter := time.Duration(float64(delay) * (rand.Float64() * 0.25))
+	delay += jitter
+
+	// Respect Retry-After hint from the error response, if present.
+	if errInfo != nil && errInfo.RetryAfter > 0 {
+		if errInfo.RetryAfter > delay {
+			delay = errInfo.RetryAfter
+		}
+
+		// Add a small additional jitter around the retry-after value.
+		extraJitter := time.Duration(float64(errInfo.RetryAfter) * (rand.Float64() * 0.1))
+		delay += extraJitter
+	}
+
+	return delay
+}
+
+// retryWithBackoff calls fn up to maxAttempts times with exponential backoff
+// between retries.  fn returns (shouldRetry bool, err error).  If shouldRetry
+// is true, the function will sleep using exponential backoff with jitter and
+// retry.  If shouldRetry is false, retryWithBackoff stops and returns the
+// error.  On success (fn returns shouldRetry=false, err=nil), returns nil.
+//
+// If fn returns a *retryAfterError, the Retry-After duration is used to
+// override the backoff delay for that attempt.  Context cancellation is
+// respected between retries.
+//
+//nolint:gosec // G404: math/rand/v2 is fine for jitter. Complexity is inherent to backoff logic.
+func retryWithBackoff(ctx context.Context, maxAttempts int, initialDelay, maxDelay time.Duration, fn func() (bool, error)) error {
+	var lastErr error
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			// Compute delay for this retry attempt.
+			delay := time.Duration(float64(initialDelay) * math.Pow(2, float64(attempt-1)))
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+
+			// Add jitter.
+			jitter := time.Duration(float64(delay) * (rand.Float64() * 0.25))
+			delay += jitter
+
+			// Check for Retry-After hint in the error.
+			var retryAfterErr *retryAfterError
+
+			if errors.As(lastErr, &retryAfterErr) && retryAfterErr.Duration > 0 {
+				if retryAfterErr.Duration > delay {
+					delay = retryAfterErr.Duration
+				}
+
+				extraJitter := time.Duration(float64(retryAfterErr.Duration) * (rand.Float64() * 0.1))
+				delay += extraJitter
+			}
+
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("retry cancelled: %w", ctx.Err())
+
+			case <-time.After(delay):
+			}
+		}
+
+		shouldRetry, err := fn()
+		if !shouldRetry {
+			return err
+		}
+
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("all %d retry attempts exhausted: %w", maxAttempts, lastErr)
+	}
+
+	return nil
 }

@@ -1,4 +1,3 @@
----
 # By default this config loads hd-driver-openai from the remote driver
 # registry. To use a pre-fetched local binary instead, load this repo with:
 #
@@ -37,3 +36,12 @@ drivers:
       default:
         api_key: '{% .env.OPENAI_API_KEY %}'
         model: gpt-5.4-mini
+        # Retry configuration for transient upstream API errors (e.g. 429 rate limit).
+        # When the driver detects a retryable error (rate_limit_exceeded,
+        # insufficient_quota, or server_error) in the API response body, it will
+        # retry the request with exponential backoff and jitter.
+        #
+        # Set retry_max_attempts to 0 to disable retries entirely.
+        # retry_max_attempts: 3
+        # retry_initial_delay: "1s"
+        # retry_max_delay: "30s"
