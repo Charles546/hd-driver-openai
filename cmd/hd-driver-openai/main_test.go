@@ -59,7 +59,7 @@ func TestExtractAPIError_InsufficientQuota(t *testing.T) {
 	t.Parallel()
 
 	raw := `{"error":{"code":"insufficient_quota","message":"You have exceeded your quota.","type":"requests"}}`
-	code, msg, errType, retryable := extractAPIError(raw)
+	code, _, _, retryable := extractAPIError(raw)
 	assert.Equal(t, "insufficient_quota", code)
 	assert.True(t, retryable)
 }
@@ -72,6 +72,7 @@ func TestExtractAPIError_ServerError(t *testing.T) {
 	assert.Equal(t, "internal_error", code)
 	assert.Equal(t, "server_error", errType)
 	assert.True(t, retryable)
+	_ = msg
 }
 
 func TestExtractAPIError_InvalidRequest(t *testing.T) {
@@ -82,6 +83,7 @@ func TestExtractAPIError_InvalidRequest(t *testing.T) {
 	assert.Equal(t, "invalid_api_key", code)
 	assert.Equal(t, "invalid_request_error", errType)
 	assert.False(t, retryable)
+	_ = msg
 }
 
 func TestExtractAPIError_BadRequest(t *testing.T) {
@@ -92,6 +94,7 @@ func TestExtractAPIError_BadRequest(t *testing.T) {
 	assert.Equal(t, "bad_request", code)
 	assert.Equal(t, "invalid_request_error", errType)
 	assert.False(t, retryable)
+	_ = msg
 }
 
 func TestExtractAPIError_InvalidJSON(t *testing.T) {
