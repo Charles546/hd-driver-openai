@@ -251,7 +251,7 @@ func sendToModel(msg *dipper.Message) {
 func classifySDKError(err error) (bool, error) {
 	var apiErr *openai.Error
 	if errors.As(err, &apiErr) {
-		if apiErr.StatusCode >= http.StatusInternalServerError {
+		if apiErr.StatusCode >= http.StatusInternalServerError || apiErr.StatusCode == http.StatusTooManyRequests {
 			// HTTP 5xx — retryable server error.
 			return true, &retryAfterError{
 				Err: fmt.Errorf("%w: server error (HTTP %d) code=%s type=%s message=%s",
@@ -327,8 +327,8 @@ func extractAPIErrorInfo(rawJSON string) *apiErrorInfo {
 		info.RetryAfter = time.Duration(retryAfter.Float() * float64(time.Second))
 	}
 
-	// Rate-limit errors are retryable.
-	if info.Code == "rate_limit_exceeded" || info.Code == "insufficient_quota" {
+	// Rate-limit errors are retryable and workaround some openrouter provider return errors.
+	if info.Code == "rate_limit_exceeded" || info.Code == "insufficient_quota" || info.Message == "Provider returned error" {
 		info.Retryable = true
 
 		return info
