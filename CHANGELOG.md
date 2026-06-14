@@ -1,3 +1,10 @@
+## [1.3.1](https://github.com/Charles546/hd-driver-openai/compare/v1.3.0...v1.3.1) (2026-06-14)
+
+
+### Bug Fixes
+
+* detect more retryable errors ([#11](https://github.com/Charles546/hd-driver-openai/issues/11)) ([667aa31](https://github.com/Charles546/hd-driver-openai/commit/667aa31d5db25aa8a062a547284a8cb2e63a816c))
+
 # [1.3.0](https://github.com/Charles546/hd-driver-openai/compare/v1.2.0...v1.3.0) (2026-06-11)
 
 
