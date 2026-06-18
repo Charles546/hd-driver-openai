@@ -1,3 +1,10 @@
+## [1.3.2](https://github.com/Charles546/hd-driver-openai/compare/v1.3.1...v1.3.2) (2026-06-18)
+
+
+### Bug Fixes
+
+* send error message to agent session on retry exhaustion ([#12](https://github.com/Charles546/hd-driver-openai/issues/12)) ([88ad814](https://github.com/Charles546/hd-driver-openai/commit/88ad814c60719f735b83e41250b4670c35549ea7))
+
 ## [1.3.1](https://github.com/Charles546/hd-driver-openai/compare/v1.3.0...v1.3.1) (2026-06-14)
 
 
