@@ -229,8 +229,9 @@ func sendToModel(msg *dipper.Message) {
 
 		switch {
 		case errors.As(err, &retryErr):
-			// All retries exhausted — log the final failure reason clearly.
+			// All retries exhausted — send error to the session via deferred recovery.
 			dipper.Logger.Errorf("[openai] retry exhausted session=%s: %v", sessionID, err)
+			dipper.Logger.Panicf("[openai] retry exhausted session=%s: %v", sessionID, err)
 
 		case errors.Is(err, errNonRetryable):
 			// Non-retryable: let the deferred recovery send an error to the session.
@@ -380,6 +381,14 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 			if contentDelivered {
 				dipper.Logger.Errorf("[openai] streaming API error after content delivered session=%s: code=%s type=%s message=%s",
 					sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+				driver.SendMessage(agentbusMessage(sessionID, agentpkg.Message{
+					Role: agentpkg.RoleAgent,
+					Content: fmt.Sprintf(
+						"streaming error after content delivered: code=%s type=%s message=%s",
+						lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message,
+					),
+					IsComplete: true,
+				}))
 
 				return
 			}
@@ -425,8 +434,10 @@ func sendToModelStreaming(ctx context.Context, client *openai.Client, params ope
 		// Retryable error before any content — loop continues.
 	}
 
-	// All retries exhausted.
+	// All retries exhausted — send error to the session via deferred recovery.
 	dipper.Logger.Errorf("[openai] streaming retry exhausted (max=%d) session=%s: code=%s type=%s message=%s",
+		retryMaxAttempts, sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
+	dipper.Logger.Panicf("[openai] streaming retry exhausted (max=%d) session=%s: code=%s type=%s message=%s",
 		retryMaxAttempts, sessionID, lastErrInfo.Code, lastErrInfo.Type, lastErrInfo.Message)
 }
 
