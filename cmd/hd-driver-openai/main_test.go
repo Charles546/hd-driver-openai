@@ -35,15 +35,6 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// tryFetchMessage attempts to read one message from the pipe, recovering from
-// the EOF panic that dipper.FetchMessage raises when the writer is closed with
-// no data.  Returns nil when no message was produced.
-func tryFetchMessage(r io.Reader) (msg *dipper.Message) {
-	defer func() { _ = recover() }()
-
-	return dipper.FetchMessage(r)
-}
-
 // defaultEngineConfig is the minimal engine options used by most tests.  It
 // sets retry_max_attempts to 1 so that retryable-error tests don't hang.
 var defaultEngineConfig = map[string]interface{}{
@@ -838,13 +829,22 @@ func TestSendToModel_RateLimitError(t *testing.T) {
 	outReader, outWriter := setupDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
-	// With retry_max_attempts=1, the server returns an error, the retry loop
-	// exhausts all attempts (just one) and returns silently.
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// With retry_max_attempts=1, the retry loop exhausts and sends an error message.
 	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
 
-	outWriter.Close()
-	msg := tryFetchMessage(outReader)
-	assert.Nil(t, msg, "no message should be sent for retryable errors")
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "retry exhausted")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 }
 
 func TestSendToModel_InvalidRequestError(t *testing.T) {
@@ -886,12 +886,22 @@ func TestSendToModel_ServerError(t *testing.T) {
 	outReader, outWriter := setupDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
-	// Server errors are retryable; with retry_max_attempts=1, no message sent.
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// Server errors are retryable; with retry_max_attempts=1, retry exhausted sends error.
 	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
 
-	outWriter.Close()
-	msg := tryFetchMessage(outReader)
-	assert.Nil(t, msg, "no message should be sent for retryable server errors")
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "retry exhausted")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 }
 
 // ─── sendToModel empty / blank response handling ────────────────────────────
@@ -942,12 +952,22 @@ func TestSendToModel_EmptyResponseBody(t *testing.T) {
 	})
 	defer outWriter.Close()
 
-	// Empty body is retryable; all retries exhausted silently.
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// Empty body is retryable; all retries exhausted sends error to session.
 	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
 
-	outWriter.Close()
-	msg := tryFetchMessage(outReader)
-	assert.Nil(t, msg, "no message for retryable empty body errors after exhaustion")
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "retry exhausted")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 }
 
 // ─── sendToModel SDK HTTP error handling ────────────────────────────────────
@@ -1101,12 +1121,22 @@ func TestSendToModel_RetryAllExhausted(t *testing.T) {
 	})
 	defer outWriter.Close()
 
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// All retries exhausted — error message sent to session.
 	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
 
-	// No message should be sent — all retries exhausted silently.
-	outWriter.Close()
-	msg := tryFetchMessage(outReader)
-	assert.Nil(t, msg, "no message should be sent when all retries are exhausted")
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "retry exhausted")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 }
 
 // ─── sendToModel non-retryable doesn't retry ────────────────────────────────
@@ -1368,14 +1398,24 @@ func TestSendToModel_StreamingRateLimitError(t *testing.T) {
 	outReader, outWriter := setupStreamingDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
-	// Retryable: with retry_max_attempts=1, should return without sending any message.
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// Retryable: with retry_max_attempts=1, retry exhausted sends error via Panicf.
 	assert.NotPanics(t, func() {
 		sendToModel(streamingMessage())
 	})
 
-	outWriter.Close()
-	msg := tryFetchMessage(outReader)
-	assert.Nil(t, msg, "no message should be sent for retryable streaming errors")
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "retry exhausted")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 }
 
 func TestSendToModel_StreamingInvalidAuthError(t *testing.T) {
@@ -1469,12 +1509,22 @@ func TestSendToModel_StreamingSSEErrorEvent(t *testing.T) {
 	outReader, outWriter := setupStreamingDriverWithServer(ts, nil)
 	defer outWriter.Close()
 
-	// With retry_max_attempts=1, this is retryable but exhausted silently.
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// With retry_max_attempts=1, retry exhausted sends error via Panicf.
 	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
 
-	outWriter.Close()
-	msg := tryFetchMessage(outReader)
-	assert.Nil(t, msg, "no message should be sent for retryable SSE error event")
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "retry exhausted")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 }
 
 // ─── sendToModel streaming retry integration ─────────────────────────────────
@@ -1591,11 +1641,22 @@ func TestSendToModel_StreamingMaxRetriesExhausted(t *testing.T) {
 	})
 	defer outWriter.Close()
 
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// All retries exhausted — error sent via Panicf deferred recovery.
 	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
 
-	outWriter.Close()
-	msg := tryFetchMessage(outReader)
-	assert.Nil(t, msg, "no message should be sent when all streaming retries exhausted")
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "retry exhausted")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error message")
+	}
 	assert.Equal(t, int32(3), connectCount.Load(), "should have attempted 3 times")
 }
 
