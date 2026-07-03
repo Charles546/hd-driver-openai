@@ -36,9 +36,10 @@ var driver *dipper.Driver
 // engineConfig holds per-engine connection and model settings loaded from
 // driver.Options["data.engines.<name>"].
 type engineConfig struct {
-	Model   string `mapstructure:"model"`
-	APIKey  string `mapstructure:"api_key"`
-	BaseURL string `mapstructure:"base_url"`
+	Model   string            `mapstructure:"model"`
+	APIKey  string            `mapstructure:"api_key"`
+	BaseURL string            `mapstructure:"base_url"`
+	Headers map[string]string `mapstructure:"headers"`
 
 	// Retry configuration for transient API errors (e.g. 429 rate limit).
 	RetryMaxAttempts  int    `mapstructure:"retry_max_attempts"`
@@ -618,6 +619,10 @@ func newOpenAIClient(cfg engineConfig) *openai.Client {
 
 	if cfg.BaseURL != "" {
 		opts = append(opts, option.WithBaseURL(cfg.BaseURL))
+	}
+
+	for k, v := range cfg.Headers {
+		opts = append(opts, option.WithHeader(k, v))
 	}
 
 	c := openai.NewClient(opts...)

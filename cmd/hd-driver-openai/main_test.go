@@ -1704,3 +1704,175 @@ func TestSendToModel_StreamingNonRetryableNoRetry(t *testing.T) {
 		t.Fatal("timed out waiting for error message")
 	}
 }
+
+// ─── newOpenAIClient / custom headers ───────────────────────────────────────
+
+func TestNewOpenAIClient_WithCustomHeaders(t *testing.T) {
+	// Create a mock server that records the headers it receives.
+	var capturedHeaders http.Header
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	defer ts.Close()
+
+	cfg := engineConfig{
+		Model:   "gpt-4o",
+		APIKey:  "test-key-123",
+		BaseURL: ts.URL + "/",
+		Headers: map[string]string{
+			"X-Custom-Header":  "custom-value",
+			"X-Another-Header": "another-value",
+		},
+	}
+
+	client := newOpenAIClient(cfg)
+	require.NotNil(t, client)
+
+	// Make a simple chat completion request to trigger the HTTP call.
+	_, err := client.Chat.Completions.New(context.Background(), openai.ChatCompletionNewParams{
+		Model:    "gpt-4o",
+		Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage("hello")},
+	})
+	require.NoError(t, err)
+
+	// Verify custom headers were sent.
+	assert.Equal(t, "custom-value", capturedHeaders.Get("X-Custom-Header"), "custom header X-Custom-Header should be present")
+	assert.Equal(t, "another-value", capturedHeaders.Get("X-Another-Header"), "custom header X-Another-Header should be present")
+}
+
+func TestNewOpenAIClient_NilHeaders(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	defer ts.Close()
+
+	cfg := engineConfig{
+		Model:   "gpt-4o",
+		APIKey:  "test-key-456",
+		BaseURL: ts.URL + "/",
+		// Headers is nil — should not cause any errors.
+	}
+
+	client := newOpenAIClient(cfg)
+	require.NotNil(t, client)
+
+	// Making a request with nil headers should succeed without panics or errors.
+	_, err := client.Chat.Completions.New(context.Background(), openai.ChatCompletionNewParams{
+		Model:    "gpt-4o",
+		Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage("hello")},
+	})
+	require.NoError(t, err)
+}
+
+func TestNewOpenAIClient_EmptyHeaders(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	defer ts.Close()
+
+	cfg := engineConfig{
+		Model:   "gpt-4o",
+		APIKey:  "test-key-789",
+		BaseURL: ts.URL + "/",
+		Headers: map[string]string{}, // empty map — should work fine.
+	}
+
+	client := newOpenAIClient(cfg)
+	require.NotNil(t, client)
+
+	_, err := client.Chat.Completions.New(context.Background(), openai.ChatCompletionNewParams{
+		Model:    "gpt-4o",
+		Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage("hello")},
+	})
+	require.NoError(t, err)
+}
+
+func TestNewOpenAIClient_CustomHeadersDontConflictWithAuthorization(t *testing.T) {
+	var capturedHeaders http.Header
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-test","object":"chat.completion","created":1234567890,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`))
+	}))
+	defer ts.Close()
+
+	cfg := engineConfig{
+		Model:   "gpt-4o",
+		APIKey:  "sk-proj-test-key-12345",
+		BaseURL: ts.URL + "/",
+		Headers: map[string]string{
+			"X-Debug-Mode": "true",
+			"X-Request-ID": "req-abc-123",
+		},
+	}
+
+	client := newOpenAIClient(cfg)
+	require.NotNil(t, client)
+
+	_, err := client.Chat.Completions.New(context.Background(), openai.ChatCompletionNewParams{
+		Model:    "gpt-4o",
+		Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage("hello")},
+	})
+	require.NoError(t, err)
+
+	// Verify Authorization header is still present and correct.
+	authHeader := capturedHeaders.Get("Authorization")
+	assert.Contains(t, authHeader, "Bearer sk-proj-test-key-12345",
+		"Authorization header should contain the API key")
+
+	// Verify custom headers are also present alongside Authorization.
+	assert.Equal(t, "true", capturedHeaders.Get("X-Debug-Mode"))
+	assert.Equal(t, "req-abc-123", capturedHeaders.Get("X-Request-ID"))
+}
+
+// ─── sendToModel integration with custom headers ────────────────────────────
+
+func TestSendToModel_WithCustomHeaders(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	var capturedHeaders http.Header
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openAITextBody("Hello with custom headers!"))
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"headers": map[string]interface{}{
+			"X-Custom-Header": "custom-value",
+			"X-Request-ID":    "req-abc-123",
+		},
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	sendToModel(testMessage("test-engine"))
+
+	result := <-done
+	require.NotNil(t, result)
+
+	// Verify the response was successful.
+	payloadMap, ok := result.Payload.(map[string]interface{})
+	require.True(t, ok)
+	msgMap, ok := payloadMap["message"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "Hello with custom headers!", msgMap["content"])
+
+	// Verify custom headers were sent with the request.
+	assert.Equal(t, "custom-value", capturedHeaders.Get("X-Custom-Header"))
+	assert.Equal(t, "req-abc-123", capturedHeaders.Get("X-Request-ID"))
+
+	// Verify Authorization header is still intact.
+	authHeader := capturedHeaders.Get("Authorization")
+	assert.Contains(t, authHeader, "Bearer test-key")
+}
