@@ -8,6 +8,7 @@ This driver enables Honeydipper's agent service to call OpenAI-compatible chat c
 - **OpenAI-compatible**: works with the official OpenAI API and any compatible endpoint (Azure OpenAI, local proxies, etc.)
 - **Tool calls**: full support for function/tool call round-trips as defined by the agent protocol
 - **Per-request overrides**: pass extra model parameters (e.g. `temperature`, `max_tokens`) via `model_data`
+- **Custom HTTP headers**: send arbitrary headers per engine (useful for provider-specific auth, tracing, or routing)
 - **Interruptible RPC**: honours driver shutdown and context cancellation
 
 ## Installation
@@ -52,6 +53,39 @@ Each engine entry supports the following fields:
 | `model`    | yes      | Model name passed to the chat completions API         |
 | `api_key`  | yes      | API key for authentication                            |
 | `base_url` | no       | Override the API base URL (useful for Azure or local) |
+| `headers`  | no       | Map of custom HTTP headers to include on every request |
+
+### Custom HTTP headers
+
+The `headers` field allows you to specify arbitrary HTTP headers that will be sent with every API request to the provider. This is useful for:
+
+- **Provider-specific authentication** (e.g. `X-API-Key`, `Authorization` overrides for proxy endpoints)
+- **Tracing and observability** (e.g. `X-Request-ID`, `X-Trace-ID`)
+- **Routing and feature flags** (e.g. `X-Model-Preference`, `X-Provider-Routing`)
+
+Example with custom headers:
+
+```yaml
+drivers:
+  openai:
+    data:
+      engines:
+        openrouter:
+          model: openai/gpt-4o
+          api_key: ${OPENROUTER_API_KEY}
+          base_url: https://openrouter.ai/api/v1/
+          headers:
+            X-Title: My Application
+            HTTP-Referer: https://myapp.example.com
+
+        local-with-tracing:
+          model: llama3
+          api_key: ignored
+          base_url: http://localhost:11434/v1/
+          headers:
+            X-Request-ID: "${HOSTNAME}"
+            X-Source: honeydipper
+```
 
 ### Wiring to the agent service
 

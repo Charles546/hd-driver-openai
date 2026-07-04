@@ -36,6 +36,12 @@ drivers:
       default:
         api_key: '{% .env.OPENAI_API_KEY %}'
         model: gpt-5.4-mini
+        # Custom HTTP headers to include with every API request to the provider.
+        # Useful for specifying provider-specific auth tokens, tracing headers,
+        # or routing information for OpenAI-compatible endpoints.
+        # headers:
+        #   X-Title: My Application
+        #   HTTP-Referer: https://myapp.example.com
         # Retry configuration for transient upstream API errors (e.g. 429 rate limit).
         # When the driver detects a retryable error (rate_limit_exceeded,
         # insufficient_quota, or server_error) in the API response body, it will
