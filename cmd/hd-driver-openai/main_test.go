@@ -599,6 +599,50 @@ func TestBuildTools_WithParam(t *testing.T) {
 	assert.Contains(t, required, "query")
 }
 
+func TestBuildTools_DeterministicOrder(t *testing.T) {
+	tools := map[string]agentpkg.Tool{
+		"z_tool": {
+			Name:        "z_tool",
+			Description: "Z tool",
+			Params: map[string]interface{}{
+				"query": map[string]interface{}{"type": "string"},
+			},
+		},
+		"a_tool": {
+			Name:        "a_tool",
+			Description: "A tool",
+			Params: map[string]interface{}{
+				"input": map[string]interface{}{"type": "string"},
+			},
+		},
+		"m_tool": {
+			Name:        "m_tool",
+			Description: "M tool",
+			Params: map[string]interface{}{
+				"value": map[string]interface{}{"type": "integer"},
+			},
+		},
+	}
+
+	// Call twice to verify deterministic ordering.
+	result1 := buildTools(tools)
+	result2 := buildTools(tools)
+
+	require.Len(t, result1, 3)
+	require.Len(t, result2, 3)
+
+	// Both calls should produce the same order (alphabetical by key).
+	for i := range result1 {
+		assert.Equal(t, result1[i].OfFunction.Function.Name, result2[i].OfFunction.Function.Name,
+			"tool order must be deterministic")
+	}
+
+	// Verify the actual order is alphabetical: a_tool, m_tool, z_tool.
+	assert.Equal(t, "a_tool", result1[0].OfFunction.Function.Name)
+	assert.Equal(t, "m_tool", result1[1].OfFunction.Function.Name)
+	assert.Equal(t, "z_tool", result1[2].OfFunction.Function.Name)
+}
+
 // ─── buildToolCalls ──────────────────────────────────────────────────────────
 
 func TestBuildToolCalls_Single(t *testing.T) {
