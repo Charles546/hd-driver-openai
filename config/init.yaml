@@ -30,6 +30,9 @@ drivers:
           This driver enables Honeydipper to interact with OpenAI's language models,
           allowing you to generate text, answer questions, and perform various natural
           language processing tasks.
+        meta:
+          labels:
+            - agent_driver
 
   openai:
     engines:
