@@ -1,3 +1,10 @@
+# [1.4.0](https://github.com/Charles546/hd-driver-openai/compare/v1.3.2...v1.4.0) (2026-07-04)
+
+
+### Features
+
+* add support for custom HTTP headers per engine instance ([#13](https://github.com/Charles546/hd-driver-openai/issues/13)) ([a969a65](https://github.com/Charles546/hd-driver-openai/commit/a969a65229d8f516ead9cc77f22b7fc04b7bfeef))
+
 ## [1.3.2](https://github.com/Charles546/hd-driver-openai/compare/v1.3.1...v1.3.2) (2026-06-18)
 
 
