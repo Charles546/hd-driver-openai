@@ -1,3 +1,10 @@
+## [1.4.1](https://github.com/Charles546/hd-driver-openai/compare/v1.4.0...v1.4.1) (2026-07-04)
+
+
+### Bug Fixes
+
+* ensure deterministic tool and parameter ordering in buildTools for prompt caching ([#14](https://github.com/Charles546/hd-driver-openai/issues/14)) ([2d63c42](https://github.com/Charles546/hd-driver-openai/commit/2d63c42d413e7b56e2a0f4c9fa82b511151e171c))
+
 # [1.4.0](https://github.com/Charles546/hd-driver-openai/compare/v1.3.2...v1.4.0) (2026-07-04)
 
 
