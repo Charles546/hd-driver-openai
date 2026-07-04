@@ -19,6 +19,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -712,17 +713,33 @@ func buildOpenAIToolCalls(histIdx int, msg *agentpkg.Message) ([]openai.ChatComp
 }
 
 // buildTools converts the agent tool map into the OpenAI tool params slice.
+
 func buildTools(tools map[string]agentpkg.Tool) []openai.ChatCompletionToolUnionParam {
 	if len(tools) == 0 {
 		return nil
 	}
 
+	// Sort keys for deterministic ordering (important for prompt caching).
+	keys := make([]string, 0, len(tools))
+	for k := range tools {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	result := make([]openai.ChatCompletionToolUnionParam, 0, len(tools))
 
-	for _, tool := range tools {
-		required := make([]string, 0, len(tool.Params))
+	for _, k := range keys {
+		tool := tools[k]
+		// Sort parameter names for deterministic ordering (important for prompt caching).
+		paramNames := make([]string, 0, len(tool.Params))
+		for pn := range tool.Params {
+			paramNames = append(paramNames, pn)
+		}
+		sort.Strings(paramNames)
 
-		for paramName, paramDef := range tool.Params {
+		required := make([]string, 0, len(tool.Params))
+		for _, paramName := range paramNames {
+			paramDef := tool.Params[paramName]
 			_, ok := paramDef.(map[string]interface{})
 			if !ok {
 				continue
