@@ -641,6 +641,36 @@ func TestBuildTools_DeterministicOrder(t *testing.T) {
 	assert.Equal(t, "a_tool", result1[0].OfFunction.Function.Name)
 	assert.Equal(t, "m_tool", result1[1].OfFunction.Function.Name)
 	assert.Equal(t, "z_tool", result1[2].OfFunction.Function.Name)
+
+	// Verify within-tool parameter order is deterministic.
+	toolsWithMultipleParams := map[string]agentpkg.Tool{
+		"multi_param_tool": {
+			Name:        "multi_param_tool",
+			Description: "Tool with multiple params",
+			Params: map[string]interface{}{
+				"z_param": map[string]interface{}{"type": "string"},
+				"a_param": map[string]interface{}{"type": "string"},
+				"m_param": map[string]interface{}{"type": "integer"},
+			},
+		},
+	}
+
+	r1 := buildTools(toolsWithMultipleParams)
+	r2 := buildTools(toolsWithMultipleParams)
+
+	require.Len(t, r1, 1)
+	require.Len(t, r2, 1)
+
+	// required should be sorted: a_param, m_param, z_param
+	params1 := r1[0].OfFunction.Function.Parameters
+	required1, ok := params1["required"].([]string)
+	require.True(t, ok)
+	assert.Equal(t, []string{"a_param", "m_param", "z_param"}, required1)
+
+	params2 := r2[0].OfFunction.Function.Parameters
+	required2, ok := params2["required"].([]string)
+	require.True(t, ok)
+	assert.Equal(t, required1, required2) // same order both times
 }
 
 // ─── buildToolCalls ──────────────────────────────────────────────────────────

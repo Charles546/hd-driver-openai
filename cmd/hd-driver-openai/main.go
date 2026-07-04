@@ -730,9 +730,16 @@ func buildTools(tools map[string]agentpkg.Tool) []openai.ChatCompletionToolUnion
 
 	for _, k := range keys {
 		tool := tools[k]
-		required := make([]string, 0, len(tool.Params))
+		// Sort parameter names for deterministic ordering (important for prompt caching).
+		paramNames := make([]string, 0, len(tool.Params))
+		for pn := range tool.Params {
+			paramNames = append(paramNames, pn)
+		}
+		sort.Strings(paramNames)
 
-		for paramName, paramDef := range tool.Params {
+		required := make([]string, 0, len(tool.Params))
+		for _, paramName := range paramNames {
+			paramDef := tool.Params[paramName]
 			_, ok := paramDef.(map[string]interface{})
 			if !ok {
 				continue
