@@ -1,3 +1,10 @@
+# [1.5.0](https://github.com/Charles546/hd-driver-openai/compare/v1.4.1...v1.5.0) (2026-07-11)
+
+
+### Features
+
+* add empty response detection and retry mechanism ([#15](https://github.com/Charles546/hd-driver-openai/issues/15)) ([c81d208](https://github.com/Charles546/hd-driver-openai/commit/c81d2081f7cd76c343f3e6bb10c8512d9fe4c012))
+
 ## [1.4.1](https://github.com/Charles546/hd-driver-openai/compare/v1.4.0...v1.4.1) (2026-07-04)
 
 
