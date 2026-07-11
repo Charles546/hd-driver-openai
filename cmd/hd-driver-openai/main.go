@@ -196,8 +196,19 @@ func sendToModel(msg *dipper.Message) {
 				dipper.Logger.Warningf("[openai] no choices in response session=%s: raw=%s",
 					sessionID, completion.RawJSON())
 
-				// Return as non-retryable so the deferred recovery sends an error to the session.
-				return false, fmt.Errorf("%w: response contains no choices", errNonRetryable)
+				// Return as retryable so the retry loop can retry the request.
+				return true, fmt.Errorf("%w: response contains no choices", errRetryable)
+			}
+
+			// Check for empty response (stop/length with no content and no tool calls).
+			if isResponseEmpty(completion) {
+				dipper.Logger.Warningf("[openai] empty response session=%s finish_reason=%s raw=%s",
+					sessionID, completion.Choices[0].FinishReason, completion.RawJSON())
+
+				return true, &retryAfterError{
+					Err: fmt.Errorf("%w: empty response (finish_reason=%s)",
+						errRetryable, completion.Choices[0].FinishReason),
+				}
 			}
 
 			// Success.
@@ -454,7 +465,7 @@ func classifyErrorTypeLabel(info *apiErrorInfo) string {
 // was delivered and any API error info detected.  Returns nil error info on
 // success.
 //
-//nolint:nestif // nesting in stream error handling is inherent to the logic
+//nolint:nestif,funlen // nesting and length are inherent to stream error handling logic
 func runStream(ctx context.Context, client *openai.Client, params openai.ChatCompletionNewParams,
 	reqOpts []option.RequestOption, sessionID string, reasoningExtraction string,
 ) (contentDelivered bool, errInfo *apiErrorInfo) {
@@ -564,7 +575,7 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 			return delivered, info
 		}
 
-		// No choices and no error — log raw JSON and return as non-retryable error.
+		// No choices and no error — log raw JSON and retry if no content was delivered.
 		dipper.Logger.Warningf("[openai] streaming no choices returned session=%s raw=%s", sessionID, rawJSON)
 
 		if !delivered {
@@ -572,9 +583,30 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 				Code:      "empty_response",
 				Message:   "streaming response contains no choices and no error",
 				Type:      "empty_response",
-				Retryable: false,
+				Retryable: true,
 			}
 		}
+
+		return delivered, nil
+	}
+
+	// Check for empty response (stop/length with no content and no tool calls).
+	if isResponseEmpty(&acc.ChatCompletion) {
+		if !delivered {
+			dipper.Logger.Warningf("[openai] streaming empty response session=%s finish_reason=%s raw=%s",
+				sessionID, acc.Choices[0].FinishReason, acc.RawJSON())
+
+			return delivered, &apiErrorInfo{
+				Code:      "empty_response",
+				Message:   "model returned complete response with no content",
+				Type:      "empty_response",
+				Retryable: true,
+			}
+		}
+
+		// Content was already delivered before final empty response.
+		// Still send the complete message to avoid hanging the session.
+		handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
 
 		return delivered, nil
 	}
@@ -582,6 +614,22 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 	handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
 
 	return delivered, nil
+}
+
+// isResponseEmpty checks whether a ChatCompletion response is effectively
+// empty — the model finished with a stop/length reason but produced no
+// content and no tool calls. Such responses cause the conversation to hang
+// because the session receives a "complete" message with nothing actionable.
+func isResponseEmpty(msg *openai.ChatCompletion) bool {
+	if len(msg.Choices) == 0 {
+		return true
+	}
+	choice := msg.Choices[0]
+	hasContent := len(choice.Message.Content) > 0
+	hasToolCalls := len(choice.Message.ToolCalls) > 0
+	isFinished := choice.FinishReason == "stop" || choice.FinishReason == "length"
+
+	return isFinished && !hasContent && !hasToolCalls
 }
 
 // handleIncomingMessage processes a single OpenAI message from the streaming endpoint,
