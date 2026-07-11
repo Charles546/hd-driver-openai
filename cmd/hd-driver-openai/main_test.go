@@ -1950,3 +1950,434 @@ func TestSendToModel_WithCustomHeaders(t *testing.T) {
 	authHeader := capturedHeaders.Get("Authorization")
 	assert.Contains(t, authHeader, "Bearer test-key")
 }
+
+// ─── isResponseEmpty ──────────────────────────────────────────────────────────
+
+func TestIsResponseEmpty_EmptyContentWithStop(t *testing.T) {
+	t.Parallel()
+
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Message: openai.ChatCompletionMessage{
+					Content: "",
+				},
+				FinishReason: "stop",
+			},
+		},
+	}
+	assert.True(t, isResponseEmpty(msg))
+}
+
+func TestIsResponseEmpty_EmptyContentWithLength(t *testing.T) {
+	t.Parallel()
+
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Message: openai.ChatCompletionMessage{
+					Content: "",
+				},
+				FinishReason: "length",
+			},
+		},
+	}
+	assert.True(t, isResponseEmpty(msg))
+}
+
+func TestIsResponseEmpty_NonEmptyContentWithStop(t *testing.T) {
+	t.Parallel()
+
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Message: openai.ChatCompletionMessage{
+					Content: "Hello, world!",
+				},
+				FinishReason: "stop",
+			},
+		},
+	}
+	assert.False(t, isResponseEmpty(msg))
+}
+
+func TestIsResponseEmpty_ToolCallsWithEmptyContent(t *testing.T) {
+	t.Parallel()
+
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Message: openai.ChatCompletionMessage{
+					Content: "",
+					ToolCalls: []openai.ChatCompletionMessageToolCallUnion{
+						{
+							Function: openai.ChatCompletionMessageFunctionToolCallFunction{
+								Name:      "search",
+								Arguments: `{}`,
+							},
+						},
+					},
+				},
+				FinishReason: "tool_calls",
+			},
+		},
+	}
+	assert.False(t, isResponseEmpty(msg))
+}
+
+func TestIsResponseEmpty_NoChoices(t *testing.T) {
+	t.Parallel()
+
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{},
+	}
+	assert.True(t, isResponseEmpty(msg))
+}
+
+func TestIsResponseEmpty_EmptyContentWithThoughts(t *testing.T) {
+	t.Parallel()
+
+	// Even with thoughts/reasoning extraction, empty content and no tool calls
+	// means the response is empty from the conversation's perspective.
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Message: openai.ChatCompletionMessage{
+					Content: "",
+					// Thoughts are not part of the ChatCompletionMessage type;
+					// they are extracted from extra fields. So this is still empty.
+				},
+				FinishReason: "stop",
+			},
+		},
+	}
+	assert.True(t, isResponseEmpty(msg))
+}
+
+func TestIsResponseEmpty_NonEmptyContentWithToolCalls(t *testing.T) {
+	t.Parallel()
+
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Message: openai.ChatCompletionMessage{
+					Content: "Let me search for that.",
+					ToolCalls: []openai.ChatCompletionMessageToolCallUnion{
+						{
+							Function: openai.ChatCompletionMessageFunctionToolCallFunction{
+								Name:      "search",
+								Arguments: `{}`,
+							},
+						},
+					},
+				},
+				FinishReason: "tool_calls",
+			},
+		},
+	}
+	assert.False(t, isResponseEmpty(msg))
+}
+
+// ─── sendToModel empty response retry integration ────────────────────────────
+
+// openAIEmptyResponseBody returns a mock HTTP 200 response body with an empty
+// content and finish_reason "stop" — simulating an empty model response.
+func openAIEmptyResponseBody() map[string]interface{} {
+	return map[string]interface{}{
+		"id": "chatcmpl-empty", "object": "chat.completion", "created": 1234567890, "model": "gpt-4o",
+		"choices": []map[string]interface{}{
+			{"index": 0, "message": map[string]interface{}{"role": "assistant", "content": ""}, "finish_reason": "stop"},
+		},
+		"usage": map[string]interface{}{"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10},
+	}
+}
+
+func TestSendToModel_EmptyResponseRetryThenSucceed(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	var callCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(callCount.Add(1))
+		w.Header().Set("Content-Type", "application/json")
+
+		if n == 1 {
+			// First call: return empty response (content="", finish_reason="stop").
+			_ = json.NewEncoder(w).Encode(openAIEmptyResponseBody())
+		} else {
+			// Second call: return valid text response.
+			_ = json.NewEncoder(w).Encode(openAITextBody("Success after empty response!"))
+		}
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "10ms",
+		"retry_max_delay":     "100ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		payloadMap, ok := result.Payload.(map[string]interface{})
+		require.True(t, ok)
+		msgMap, ok := payloadMap["message"].(map[string]interface{})
+		require.True(t, ok)
+		assert.Equal(t, "Success after empty response!", msgMap["content"])
+		assert.True(t, msgMap["is_complete"].(bool))
+		// Should have been called twice (first empty, then success).
+		assert.Equal(t, int32(2), callCount.Load(), "should have retried once")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for successful response after empty response retry")
+	}
+}
+
+func TestSendToModel_EmptyResponseRetryExhausted(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	var callCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		// Always return empty response.
+		_ = json.NewEncoder(w).Encode(openAIEmptyResponseBody())
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// All retries exhausted — error message sent to session.
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "retry exhausted")
+		// Should have been called 3 times (initial + 2 retries).
+		assert.Equal(t, int32(3), callCount.Load(), "should have attempted 3 times")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error message after empty response retry exhaustion")
+	}
+}
+
+// ─── sendToModel streaming empty response retry integration ─────────────────
+
+// streamingEmptyResponseChunks returns SSE chunks that simulate an empty
+// streaming response with finish_reason "stop" and no content.
+func streamingEmptyResponseChunks() []map[string]interface{} {
+	return []map[string]interface{}{
+		streamingChunk("", "stop"),
+	}
+}
+
+func TestSendToModel_StreamingEmptyResponseRetryThenSucceed(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	var connectCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(connectCount.Add(1))
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		if n == 1 {
+			// First connection: return empty response with finish_reason="stop".
+			for _, chunk := range streamingEmptyResponseChunks() {
+				b, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", b)
+			}
+		} else {
+			// Subsequent connections: return a successful streaming response.
+			chunk1, _ := json.Marshal(streamingChunk("Hello after retry!", ""))
+			fmt.Fprintf(w, "data: %s\n\n", chunk1)
+			chunk2, _ := json.Marshal(streamingChunk("", "stop"))
+			fmt.Fprintf(w, "data: %s\n\n", chunk2)
+		}
+
+		fmt.Fprint(w, "data: [DONE]\n\n")
+
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "10ms",
+		"retry_max_delay":     "100ms",
+	})
+	defer outWriter.Close()
+
+	// Collect all messages.
+	var msgs []*dipper.Message
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for {
+			var m *dipper.Message
+			var panicked bool
+
+			func() {
+				defer func() {
+					if recover() != nil {
+						panicked = true
+					}
+				}()
+
+				m = dipper.FetchMessage(outReader)
+			}()
+
+			if panicked || m == nil {
+				return
+			}
+
+			msgs = append(msgs, m)
+		}
+	}()
+
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+	outWriter.Close()
+	<-done
+
+	require.GreaterOrEqual(t, len(msgs), 1, "expected at least one message after streaming empty response retry")
+
+	last := msgs[len(msgs)-1]
+	payloadMap := last.Payload.(map[string]interface{})
+	msgMap := payloadMap["message"].(map[string]interface{})
+	assert.True(t, msgMap["is_complete"].(bool))
+	assert.Contains(t, msgMap["content"], "Hello after retry!")
+	// Should have connected twice (first empty, then success).
+	assert.Equal(t, int32(2), connectCount.Load(), "should have retried once")
+}
+
+func TestSendToModel_StreamingEmptyResponseRetryExhausted(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	var connectCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connectCount.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		// Always return empty response with finish_reason="stop".
+		for _, chunk := range streamingEmptyResponseChunks() {
+			b, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+		}
+
+		fmt.Fprint(w, "data: [DONE]\n\n")
+
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// All retries exhausted — error sent via Panicf deferred recovery.
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "retry exhausted")
+		assert.Equal(t, int32(3), connectCount.Load(), "should have attempted 3 times")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error message after streaming empty response retry exhaustion")
+	}
+}
+
+// TestSendToModel_StreamingEmptyChoicesRetryable verifies that the
+// len(acc.Choices) == 0 case in the streaming path is now retryable
+// when no content has been delivered yet.
+func TestSendToModel_StreamingEmptyChoicesRetryable(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	var connectCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connectCount.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		// Return a chunk with no choices (just usage data) — triggers the
+		// len(acc.Choices) == 0 path which should now be retryable.
+		chunk := map[string]interface{}{
+			"id": "id1", "object": "chat.completion.chunk", "created": 1234567890, "model": "gpt-4o",
+			"choices": []interface{}{},
+		}
+		b, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	// With retry_max_attempts=3, all retries exhaust and send error.
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "receive", result.Subject)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "retry exhausted")
+		// Should have been called 3 times since it's now retryable.
+		assert.Equal(t, int32(3), connectCount.Load(), "should have attempted 3 times (retryable)")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error message after streaming empty choices retry")
+	}
+}
