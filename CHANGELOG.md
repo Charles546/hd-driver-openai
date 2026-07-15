@@ -1,3 +1,10 @@
+# [1.6.0](https://github.com/Charles546/hd-driver-openai/compare/v1.5.0...v1.6.0) (2026-07-15)
+
+
+### Features
+
+* Add IsChunk field support for streaming protocol ([#17](https://github.com/Charles546/hd-driver-openai/issues/17)) ([6a07817](https://github.com/Charles546/hd-driver-openai/commit/6a078173b5b5a4109930761edfa0509a98ba1caf))
+
 # [1.5.0](https://github.com/Charles546/hd-driver-openai/compare/v1.4.1...v1.5.0) (2026-07-11)
 
 
