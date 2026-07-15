@@ -493,6 +493,7 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 				Role:       agentpkg.RoleAgent,
 				Content:    refusal,
 				IsComplete: true,
+				IsChunk:    false, // Refusal is a complete message, not a chunk
 			}))
 
 			return delivered, nil
@@ -507,6 +508,7 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 			Role:       agentpkg.RoleAgent,
 			Content:    choice.Delta.Content,
 			IsComplete: false,
+			IsChunk:    true, // Each streaming delta is a chunk
 		}
 
 		if len(choice.Delta.JSON.ExtraFields) > 0 && reasoningExtraction != "" {
@@ -641,6 +643,7 @@ func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoni
 	agentMsg := agentpkg.Message{
 		Role:       agentpkg.RoleAgent,
 		IsComplete: choice.FinishReason == "stop" || choice.FinishReason == "tool_calls" || len(cm.ToolCalls) > 0,
+		IsChunk:    false, // Non-streaming / final completion is not a chunk
 		Content:    cm.Content,
 	}
 
