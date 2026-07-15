@@ -869,7 +869,7 @@ func TestSendToModel_ToolCallResponse(t *testing.T) {
 	msgMap, ok := payloadMap["message"].(map[string]interface{})
 	require.True(t, ok)
 	assert.Equal(t, agentpkg.RoleAgent, msgMap["Role"])
-	assert.False(t, msgMap["is_complete"].(bool))
+	assert.True(t, msgMap["is_complete"].(bool))
 
 	rawCalls, ok := msgMap["ToolCalls"].([]interface{})
 	require.True(t, ok)
@@ -1435,7 +1435,7 @@ func TestSendToModel_StreamingToolCallResponse(t *testing.T) {
 	require.True(t, ok)
 
 	assert.Equal(t, agentpkg.RoleAgent, msgMap["Role"])
-	assert.False(t, msgMap["is_complete"].(bool))
+	assert.True(t, msgMap["is_complete"].(bool))
 
 	rawCalls, ok := msgMap["ToolCalls"].([]interface{})
 	require.True(t, ok)
