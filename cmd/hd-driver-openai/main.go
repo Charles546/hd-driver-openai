@@ -76,6 +76,7 @@ func (e *retryAfterError) Unwrap() error { return e.Err }
 
 func main() {
 	flag.Parse()
+
 	driver = dipper.NewDriver(flag.Arg(0), "openai")
 	driver.RPCHandlers["send_to_model|interruptible"] = sendToModel
 	driver.Reload = func(m *dipper.Message) {}
@@ -205,9 +206,19 @@ func sendToModel(msg *dipper.Message) {
 				dipper.Logger.Warningf("[openai] empty response session=%s finish_reason=%s raw=%s",
 					sessionID, completion.Choices[0].FinishReason, completion.RawJSON())
 
+				// Check if finish_reason indicates truncation that should be returned to agent
+				finishReason := completion.Choices[0].FinishReason
+				if finishReason == "length" || finishReason == "content_filter" {
+					// Truncated response - send to agent with IsComplete=false, don't retry
+
+					handleIncomingMessage(completion, sessionID, reasoningExtraction)
+
+					return false, nil
+				}
+
+				// Empty response with stop - retryable
 				return true, &retryAfterError{
-					Err: fmt.Errorf("%w: empty response (finish_reason=%s)",
-						errRetryable, completion.Choices[0].FinishReason),
+					Err: fmt.Errorf("%w: empty response (finish_reason=%s)", errRetryable, finishReason),
 				}
 			}
 
@@ -471,6 +482,7 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 ) (contentDelivered bool, errInfo *apiErrorInfo) {
 	streamer := client.Chat.Completions.NewStreaming(ctx, params, reqOpts...)
 	acc := openai.ChatCompletionAccumulator{}
+
 	delivered := false
 
 	for streamer.Next() {
@@ -493,6 +505,7 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 				Role:       agentpkg.RoleAgent,
 				Content:    refusal,
 				IsComplete: true,
+				IsChunk:    false, // Refusal is a complete message, not a chunk
 			}))
 
 			return delivered, nil
@@ -507,6 +520,7 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 			Role:       agentpkg.RoleAgent,
 			Content:    choice.Delta.Content,
 			IsComplete: false,
+			IsChunk:    true, // Each streaming delta is a chunk
 		}
 
 		if len(choice.Delta.JSON.ExtraFields) > 0 && reasoningExtraction != "" {
@@ -596,6 +610,15 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 			dipper.Logger.Warningf("[openai] streaming empty response session=%s finish_reason=%s raw=%s",
 				sessionID, acc.Choices[0].FinishReason, acc.RawJSON())
 
+			// Check if finish_reason indicates truncation that should be returned to agent
+			finishReason := acc.Choices[0].FinishReason
+			if finishReason == "length" || finishReason == "content_filter" {
+				// Truncated response - send to agent with IsComplete=false, don't retry
+				handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
+
+				return delivered, nil
+			}
+
 			return delivered, &apiErrorInfo{
 				Code:      "empty_response",
 				Message:   "model returned complete response with no content",
@@ -611,6 +634,7 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 		return delivered, nil
 	}
 
+	// Final completion - send final message with IsChunk=false via handleIncomingMessage
 	handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
 
 	return delivered, nil
@@ -625,6 +649,7 @@ func isResponseEmpty(msg *openai.ChatCompletion) bool {
 		return true
 	}
 	choice := msg.Choices[0]
+
 	hasContent := len(choice.Message.Content) > 0
 	hasToolCalls := len(choice.Message.ToolCalls) > 0
 	isFinished := choice.FinishReason == "stop" || choice.FinishReason == "length"
@@ -638,9 +663,30 @@ func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoni
 	choice := msg.Choices[0]
 	cm := choice.Message
 
+	// Determine IsComplete based on finish_reason and tool calls
+	// - "stop" -> IsComplete=true (normal completion)
+	// - "tool_calls" with actual tool calls -> IsComplete=false (execute tools)
+	// - "tool_calls" without tool calls -> IsComplete=true
+	// - "length" or "content_filter" -> IsComplete=false (truncated, agent will continue)
+	isComplete := false
+	// Determine IsComplete based on finish_reason
+	switch choice.FinishReason {
+	case "stop":
+		isComplete = true // Normal completion
+	case "tool_calls":
+		if len(cm.ToolCalls) > 0 {
+			isComplete = false // Tool calls present, turn continues for tool execution
+		} else {
+			isComplete = true // No tool calls despite finish_reason, treat as complete
+		}
+	case "length", "content_filter":
+		isComplete = false // Truncated - agent will continue the conversation
+	}
+
 	agentMsg := agentpkg.Message{
 		Role:       agentpkg.RoleAgent,
-		IsComplete: choice.FinishReason == "stop" || choice.FinishReason == "tool_calls" || len(cm.ToolCalls) > 0,
+		IsComplete: isComplete,
+		IsChunk:    false, // Non-streaming / final completion is not a chunk
 		Content:    cm.Content,
 	}
 
