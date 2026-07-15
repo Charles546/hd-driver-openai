@@ -64,6 +64,12 @@ var errRetryable = errors.New("retryable API error")
 // errNonRetryable is a static sentinel for non-retryable API errors.
 var errNonRetryable = errors.New("non-retryable API error")
 
+// errNoChoices is returned when the response contains no choices.
+var errNoChoices = errors.New("no choices in response")
+
+// errUnexpectedFalse is returned when handleIncomingMessage unexpectedly returns false.
+var errUnexpectedFalse = errors.New("handleIncomingMessage returned false without error")
+
 // retryAfterError wraps a retryable error with an optional Retry-After hint.
 type retryAfterError struct {
 	Duration time.Duration
@@ -212,7 +218,15 @@ func sendToModel(msg *dipper.Message) {
 			}
 
 			// Success.
-			handleIncomingMessage(completion, sessionID, reasoningExtraction)
+			sent, err := handleIncomingMessage(completion, sessionID, reasoningExtraction)
+			if err != nil {
+				// Empty error response - treat as retryable error
+				return true, err
+			}
+			if !sent {
+				// Should not happen with new logic, but handle gracefully
+				return true, errUnexpectedFalse
+			}
 
 			return false, nil
 		}
@@ -606,12 +620,46 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 
 		// Content was already delivered before final empty response.
 		// Still send the complete message to avoid hanging the session.
-		handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
+		sent, err := handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
+		if err != nil {
+			return delivered, &apiErrorInfo{
+				Code:      "empty_error_response",
+				Message:   err.Error(),
+				Type:      "empty_error_response",
+				Retryable: true,
+			}
+		}
+		if !sent {
+			return delivered, &apiErrorInfo{
+				Code:      "stream_error",
+				Message:   "stream ended without sending message",
+				Type:      "stream_error",
+				Retryable: false,
+			}
+		}
 
 		return delivered, nil
 	}
 
-	handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
+	sent, err := handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
+	if err != nil {
+		// Empty error response in stream - return retryable error
+		return delivered, &apiErrorInfo{
+			Code:      "empty_error_response",
+			Message:   err.Error(),
+			Type:      "empty_error_response",
+			Retryable: true,
+		}
+	}
+	if !sent {
+		// Should not happen
+		return delivered, &apiErrorInfo{
+			Code:      "stream_error",
+			Message:   "stream ended without sending message",
+			Type:      "stream_error",
+			Retryable: false,
+		}
+	}
 
 	return delivered, nil
 }
@@ -634,13 +682,67 @@ func isResponseEmpty(msg *openai.ChatCompletion) bool {
 
 // handleIncomingMessage processes a single OpenAI message from the streaming endpoint,
 // sending appropriate agent messages for content, tool calls, and reasoning texts.
-func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoningExtraction string) {
+// Returns (sent, error):
+// - (true, nil): message was sent successfully
+// - (false, error): empty error response - should trigger retry
+// - (false, nil): message not sent (should not happen with current logic).
+func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoningExtraction string) (bool, error) {
+	if len(msg.Choices) == 0 {
+		return false, errNoChoices
+	}
+
 	choice := msg.Choices[0]
 	cm := choice.Message
 
+	// Check for content (content, thoughts, or tool calls)
+	hasContent := len(cm.Content) > 0
+	hasThoughts := false
+	if fields := cm.JSON.ExtraFields; fields != nil && reasoningExtraction != "" {
+		if think, ok := fields[reasoningExtraction]; ok {
+			var reasoning string
+			dipper.Must(json.Unmarshal([]byte(think.Raw()), &reasoning))
+			if len(reasoning) > 0 {
+				hasThoughts = true
+			}
+		}
+	}
+	hasToolCalls := len(cm.ToolCalls) > 0
+	hasAnyContent := hasContent || hasThoughts || hasToolCalls
+
+	// Determine if message is complete based on finish_reason
+	var isComplete bool
+	finishReason := choice.FinishReason
+
+	switch finishReason {
+	case "error":
+		if hasAnyContent {
+			// Error with content - send partial content with IsComplete: false
+			// so the agent can process and continue the conversation
+			isComplete = false
+		} else {
+			// Error with no content - treat as retryable error
+			dipper.Logger.Warningf("[openai] empty error response session=%s finish_reason=%s raw=%s",
+				sessionID, finishReason, msg.RawJSON())
+
+			return false, fmt.Errorf("%w: empty error response from model (finish_reason=error)", errRetryable)
+		}
+	case "length":
+		// Incomplete response (max tokens reached) - not complete
+		isComplete = false
+	case "tool_calls":
+		// Tool calls are a complete response from the model
+		isComplete = true
+	case "stop":
+		// Normal completion - isComplete = true
+		isComplete = true
+	default:
+		// Unknown finish reason - treat as complete to avoid hanging
+		isComplete = true
+	}
+
 	agentMsg := agentpkg.Message{
 		Role:       agentpkg.RoleAgent,
-		IsComplete: choice.FinishReason == "stop" || choice.FinishReason == "tool_calls" || len(cm.ToolCalls) > 0,
+		IsComplete: isComplete,
 		Content:    cm.Content,
 	}
 
@@ -652,7 +754,7 @@ func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoni
 		}
 	}
 
-	if choice.FinishReason == "tool_calls" && len(cm.ToolCalls) > 0 {
+	if finishReason == "tool_calls" && len(cm.ToolCalls) > 0 {
 		agentMsg.ToolCalls = buildToolCalls(cm.ToolCalls)
 	}
 
@@ -660,6 +762,8 @@ func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoni
 	agentMsg.OutputTokens = int(msg.Usage.CompletionTokens)
 
 	driver.SendMessage(agentbusMessage(sessionID, agentMsg))
+
+	return true, nil
 }
 
 // newOpenAIClient creates an OpenAI client from the per-engine configuration.
