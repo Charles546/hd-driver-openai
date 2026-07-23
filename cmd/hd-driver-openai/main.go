@@ -728,6 +728,19 @@ func buildMessages(history []agentpkg.Message, reasoningInjection string) []open
 					id = lastToolCallIDs[i]
 				}
 
+				// Guard against incomplete history (e.g. compaction removed the
+				// preceding assistant tool-call message).  Sending a ToolMessage
+				// with an empty tool_call_id fails validation on some
+				// Anthropic-compatible endpoints (Bedrock, LiteLLM).
+				if id == "" {
+					dipper.Logger.Warningf(
+						"[openai] skipping tool result at history index %d result index %d: "+
+							"no matching tool_call_id found in lastToolCallIDs (len=%d)",
+						histIdx, i, len(lastToolCallIDs))
+
+					continue
+				}
+
 				resultBytes, _ := json.Marshal(result)
 				msgs = append(msgs, openai.ToolMessage(string(resultBytes), id))
 			}
