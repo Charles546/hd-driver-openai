@@ -549,6 +549,57 @@ func TestBuildMessages_MultipleToolResults(t *testing.T) {
 	assert.NotNil(t, msgs[2].OfTool)
 }
 
+// TestBuildMessages_ToolResultWithoutMatchingToolCall verifies that a
+// RoleToolResult message without a preceding tool-call message (incomplete
+// history, e.g. compaction dropped the assistant tool-call turn) does NOT
+// produce a ToolMessage with an empty tool_call_id.  Such an empty ID would
+// fail validation on Anthropic-compatible endpoints (Bedrock, LiteLLM).
+func TestBuildMessages_ToolResultWithoutMatchingToolCall(t *testing.T) {
+	// History that is missing the preceding RoleAgent/RoleTool with tool calls:
+	// only a RoleToolResult remains.  lastToolCallIDs will be empty.
+	history := []agentpkg.Message{
+		{
+			Role:       agentpkg.RoleToolResult,
+			ToolResult: []map[string]interface{}{{"result": "ok"}},
+		},
+	}
+	msgs := buildMessages(history, "")
+	// The orphaned tool result must be skipped, not emitted with an empty ID.
+	assert.Empty(t, msgs)
+}
+
+// TestBuildMessages_ToolResultPartialMatch verifies that when fewer prior tool
+// call IDs exist than tool results, only the results without a matching ID are
+// skipped; the ones with a valid ID are still emitted.
+func TestBuildMessages_ToolResultPartialMatch(t *testing.T) {
+	history := []agentpkg.Message{
+		{
+			Role:       agentpkg.RoleAgent,
+			IsComplete: true,
+			ToolCalls: []agentpkg.ToolCall{
+				{FuncName: "fn1", Params: map[string]interface{}{}},
+			},
+		},
+		{
+			// Two results but only one matching tool-call ID (id=0). The
+			// second result (i=1) has no matching ID and must be skipped.
+			Role: agentpkg.RoleToolResult,
+			ToolResult: []map[string]interface{}{
+				{"out": "a"},
+				{"out": "b"},
+			},
+		},
+	}
+	msgs := buildMessages(history, "")
+	// 1 assistant message + 1 tool result (the unmatched one is skipped).
+	require.Len(t, msgs, 2)
+	require.NotNil(t, msgs[0].OfAssistant)
+	assert.Len(t, msgs[0].OfAssistant.ToolCalls, 1)
+	// Only the first result should produce a ToolMessage.
+	require.NotNil(t, msgs[1].OfTool)
+	assert.Equal(t, "call_0_0", msgs[1].OfTool.ToolCallID)
+}
+
 func TestBuildMessages_ReasoningInjection(t *testing.T) {
 	history := []agentpkg.Message{
 		{Role: agentpkg.RoleAgent, Content: "I think first.", Thoughts: "internal reasoning"},
