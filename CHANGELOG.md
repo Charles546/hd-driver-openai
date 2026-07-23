@@ -1,3 +1,10 @@
+## [1.6.1](https://github.com/Charles546/hd-driver-openai/compare/v1.6.0...v1.6.1) (2026-07-23)
+
+
+### Bug Fixes
+
+* skip tool results with empty tool_call_id in buildMessages ([#18](https://github.com/Charles546/hd-driver-openai/issues/18)) ([ec20311](https://github.com/Charles546/hd-driver-openai/commit/ec203111c82dbdc45a6ef0a39f3085dcf0ebd45f))
+
 # [1.6.0](https://github.com/Charles546/hd-driver-openai/compare/v1.5.0...v1.6.0) (2026-07-15)
 
 
