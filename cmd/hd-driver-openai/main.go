@@ -627,7 +627,7 @@ func isResponseEmpty(msg *openai.ChatCompletion) bool {
 		return true
 	}
 	choice := msg.Choices[0]
-	hasContent := len(choice.Message.Content) > 0
+	hasContent := len(strings.TrimSpace(choice.Message.Content)) > 0
 	hasToolCalls := len(choice.Message.ToolCalls) > 0
 
 	return !hasContent && !hasToolCalls
