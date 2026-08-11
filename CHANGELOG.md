@@ -1,3 +1,10 @@
+## [1.6.3](https://github.com/Charles546/hd-driver-openai/compare/v1.6.2...v1.6.3) (2026-08-11)
+
+
+### Bug Fixes
+
+* treat whitespace-only responses as empty for retry ([#20](https://github.com/Charles546/hd-driver-openai/issues/20)) ([64210ef](https://github.com/Charles546/hd-driver-openai/commit/64210ef256bb325c9bbed5a9fe15feb2b53e6cf2))
+
 ## [1.6.2](https://github.com/Charles546/hd-driver-openai/compare/v1.6.1...v1.6.2) (2026-08-11)
 
 
