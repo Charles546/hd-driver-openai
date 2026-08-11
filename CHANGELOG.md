@@ -1,3 +1,10 @@
+## [1.6.2](https://github.com/Charles546/hd-driver-openai/compare/v1.6.1...v1.6.2) (2026-08-11)
+
+
+### Bug Fixes
+
+* correct detecting empty response for retrying ([#19](https://github.com/Charles546/hd-driver-openai/issues/19)) ([424f9b6](https://github.com/Charles546/hd-driver-openai/commit/424f9b6bd3cf5538734bd5a5f672e89c6522e71f))
+
 ## [1.6.1](https://github.com/Charles546/hd-driver-openai/compare/v1.6.0...v1.6.1) (2026-07-23)
 
 
