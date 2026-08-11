@@ -629,9 +629,8 @@ func isResponseEmpty(msg *openai.ChatCompletion) bool {
 	choice := msg.Choices[0]
 	hasContent := len(choice.Message.Content) > 0
 	hasToolCalls := len(choice.Message.ToolCalls) > 0
-	isFinished := choice.FinishReason == "stop" || choice.FinishReason == "length"
 
-	return isFinished && !hasContent && !hasToolCalls
+	return !hasContent && !hasToolCalls
 }
 
 // handleIncomingMessage processes a single OpenAI message from the streaming endpoint,
