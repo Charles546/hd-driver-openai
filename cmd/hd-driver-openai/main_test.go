@@ -2129,6 +2129,70 @@ func TestIsResponseEmpty_NonEmptyContentWithToolCalls(t *testing.T) {
 	assert.False(t, isResponseEmpty(msg))
 }
 
+func TestIsResponseEmpty_WhitespaceOnlyContent(t *testing.T) {
+	t.Parallel()
+
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Message: openai.ChatCompletionMessage{
+					Content: "   ",
+				},
+				FinishReason: "stop",
+			},
+		},
+	}
+	assert.True(t, isResponseEmpty(msg))
+}
+
+func TestIsResponseEmpty_NewlinesOnlyContent(t *testing.T) {
+	t.Parallel()
+
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Message: openai.ChatCompletionMessage{
+					Content: "\n\n",
+				},
+				FinishReason: "stop",
+			},
+		},
+	}
+	assert.True(t, isResponseEmpty(msg))
+}
+
+func TestIsResponseEmpty_TabsOnlyContent(t *testing.T) {
+	t.Parallel()
+
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Message: openai.ChatCompletionMessage{
+					Content: "\t\t",
+				},
+				FinishReason: "stop",
+			},
+		},
+	}
+	assert.True(t, isResponseEmpty(msg))
+}
+
+func TestIsResponseEmpty_MixedWhitespaceContent(t *testing.T) {
+	t.Parallel()
+
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Message: openai.ChatCompletionMessage{
+					Content: " \t\n \r\n ",
+				},
+				FinishReason: "stop",
+			},
+		},
+	}
+	assert.True(t, isResponseEmpty(msg))
+}
+
 // ─── sendToModel empty response retry integration ────────────────────────────
 
 // openAIEmptyResponseBody returns a mock HTTP 200 response body with an empty
