@@ -15,12 +15,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	agentpkg "github.com/honeydipper/honeydipper/v4/pkg/agent"
 	"github.com/honeydipper/honeydipper/v4/pkg/dipper"
+	"github.com/op/go-logging"
 	openai "github.com/openai/openai-go/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -2495,4 +2497,133 @@ func TestSendToModel_StreamingEmptyChoicesRetryable(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for error message after streaming empty choices retry")
 	}
+}
+
+// ─── isDebugEmptyComplete ─────────────────────────────────────────────────────
+
+func TestIsDebugEmptyComplete(t *testing.T) {
+	t.Parallel()
+
+	// Empty-complete: no content, thoughts, or tool calls → true.
+	empty := agentpkg.Message{Role: agentpkg.RoleAgent, IsComplete: true}
+	assert.True(t, isDebugEmptyComplete(empty))
+
+	// Whitespace-only content still counts as empty → true.
+	whitespace := agentpkg.Message{Role: agentpkg.RoleAgent, IsComplete: true, Content: " \t\n "}
+	assert.True(t, isDebugEmptyComplete(whitespace))
+
+	// Has content → false.
+	hasContent := agentpkg.Message{Role: agentpkg.RoleAgent, IsComplete: true, Content: "hello"}
+	assert.False(t, isDebugEmptyComplete(hasContent))
+
+	// Has thoughts → false.
+	hasThoughts := agentpkg.Message{Role: agentpkg.RoleAgent, IsComplete: true, Thoughts: "reasoning"}
+	assert.False(t, isDebugEmptyComplete(hasThoughts))
+
+	// Has tool calls → false.
+	hasToolCalls := agentpkg.Message{
+		Role:       agentpkg.RoleAgent,
+		IsComplete: true,
+		ToolCalls:  []agentpkg.ToolCall{{FuncName: "fn"}},
+	}
+	assert.False(t, isDebugEmptyComplete(hasToolCalls))
+
+	// Not complete → false.
+	notComplete := agentpkg.Message{Role: agentpkg.RoleAgent, IsComplete: false}
+	assert.False(t, isDebugEmptyComplete(notComplete))
+
+	// Is a chunk → false.
+	isChunk := agentpkg.Message{Role: agentpkg.RoleAgent, IsComplete: true, IsChunk: true}
+	assert.False(t, isDebugEmptyComplete(isChunk))
+}
+
+// isDebugEmptyCompleteDebugCapture installs a memory-backed logger on the
+// dipper.Logger singleton so the diagnostics under test can be inspected, and
+// restores the previous logger afterwards.
+func isDebugEmptyCompleteDebugCapture(t *testing.T) *logging.MemoryBackend {
+	t.Helper()
+
+	mem := logging.NewMemoryBackend(10240)
+	backend := logging.AddModuleLevel(logging.NewBackendFormatter(mem, logging.MustStringFormatter("%{message}")))
+	backend.SetLevel(logging.DEBUG, "")
+	debugLogger := logging.MustGetLogger("openai-debug-capture")
+	debugLogger.SetBackend(backend)
+
+	oldLogger := dipper.Logger
+	dipper.Logger = debugLogger
+	t.Cleanup(func() { dipper.Logger = oldLogger })
+
+	return mem
+}
+
+// collectLogMessages reads every record from a memory log backend and returns
+// the plain-text messages.
+func collectLogMessages(mem *logging.MemoryBackend) []string {
+	var msgs []string
+	for n := mem.Head(); n != nil; n = n.Next() {
+		msgs = append(msgs, n.Record.Message())
+	}
+
+	return msgs
+}
+
+// TestHandleIncomingMessage_DebugEmptyCompleteLogsAndSends verifies that when
+// the debug toggle is enabled, an empty-complete agent message passing through
+// handleIncomingMessage produces the diagnostic log while the outbound message
+// is still sent unchanged.
+func TestHandleIncomingMessage_DebugEmptyCompleteLogsAndSends(t *testing.T) {
+	// Note: NOT t.Parallel() because it mutates global driver/logger/toggle state.
+
+	oldToggle := emptyCompleteDebugEnabled
+	emptyCompleteDebugEnabled = true
+	defer func() { emptyCompleteDebugEnabled = oldToggle }()
+
+	mem := isDebugEmptyCompleteDebugCapture(t)
+
+	outReader, outWriter := io.Pipe()
+	defer outWriter.Close()
+	driver = &dipper.Driver{Out: outWriter}
+
+	msg := &openai.ChatCompletion{
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Index:        0,
+				Message:      openai.ChatCompletionMessage{Content: ""},
+				FinishReason: "stop",
+			},
+		},
+		Usage: openai.CompletionUsage{PromptTokens: 10, CompletionTokens: 0},
+	}
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	handleIncomingMessage(msg, "sess-debug", "", "non-streaming")
+
+	// The message must still be sent, unchanged.
+	result := <-done
+	require.NotNil(t, result)
+	payloadMap, ok := result.Payload.(map[string]interface{})
+	require.True(t, ok)
+	msgMap, ok := payloadMap["message"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, agentpkg.RoleAgent, msgMap["Role"])
+	assert.Equal(t, "", msgMap["content"])
+	assert.True(t, msgMap["is_complete"].(bool))
+	assert.False(t, msgMap["is_chunk"].(bool))
+
+	// The diagnostic log must have been produced.
+	logMsgs := collectLogMessages(mem)
+	found := false
+	for _, lm := range logMsgs {
+		if strings.Contains(lm, "[openai] DEBUG empty-complete agent message detected") {
+			found = true
+			assert.Contains(t, lm, "sess-debug")
+			assert.Contains(t, lm, "non-streaming")
+			assert.Contains(t, lm, "content_len=0")
+
+			break
+		}
+	}
+	assert.True(t, found, "expected diagnostic log; got: %v", logMsgs)
 }
