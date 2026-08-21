@@ -1,3 +1,10 @@
+# [1.7.0](https://github.com/Charles546/hd-driver-openai/compare/v1.6.3...v1.7.0) (2026-08-21)
+
+
+### Features
+
+* add debug detection for empty-complete agent messages ([#21](https://github.com/Charles546/hd-driver-openai/issues/21)) ([ccdc74c](https://github.com/Charles546/hd-driver-openai/commit/ccdc74c5d7fefc7bfebb6b0fed0351a295529f83))
+
 ## [1.6.3](https://github.com/Charles546/hd-driver-openai/compare/v1.6.2...v1.6.3) (2026-08-11)
 
 
