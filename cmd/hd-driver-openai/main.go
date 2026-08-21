@@ -19,7 +19,9 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +35,14 @@ import (
 )
 
 var driver *dipper.Driver
+
+// emptyCompleteDebugEnabled is a runtime toggle read from the
+// HD_DRIVER_DEBUG_EMPTY environment variable at startup.  When enabled, the
+// driver logs a diagnostic message whenever an empty-complete agent message
+// (IsComplete=true with no content, thoughts, or tool calls) is about to be
+// sent.  This is a pure diagnostic overlay: it never drops, alters, or
+// re-routes messages.
+var emptyCompleteDebugEnabled bool
 
 // engineConfig holds per-engine connection and model settings loaded from
 // driver.Options["data.engines.<name>"].
@@ -76,6 +86,7 @@ func (e *retryAfterError) Unwrap() error { return e.Err }
 
 func main() {
 	flag.Parse()
+	loadEmptyCompleteDebug()
 	driver = dipper.NewDriver(flag.Arg(0), "openai")
 	driver.RPCHandlers["send_to_model|interruptible"] = sendToModel
 	driver.Reload = func(m *dipper.Message) {}
@@ -212,7 +223,7 @@ func sendToModel(msg *dipper.Message) {
 			}
 
 			// Success.
-			handleIncomingMessage(completion, sessionID, reasoningExtraction)
+			handleIncomingMessage(completion, sessionID, reasoningExtraction, "non-streaming")
 
 			return false, nil
 		}
@@ -608,12 +619,12 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 
 		// Content was already delivered before final empty response.
 		// Still send the complete message to avoid hanging the session.
-		handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
+		handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction, "streaming")
 
 		return delivered, nil
 	}
 
-	handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction)
+	handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction, "streaming")
 
 	return delivered, nil
 }
@@ -633,9 +644,66 @@ func isResponseEmpty(msg *openai.ChatCompletion) bool {
 	return !hasContent && !hasToolCalls
 }
 
+// loadEmptyCompleteDebug reads the HD_DRIVER_DEBUG_EMPTY environment variable
+// once at startup and stores the result in the package-level
+// emptyCompleteDebugEnabled flag.  Values "1" or "true" (as parsed by
+// strconv.ParseBool) enable the diagnostic; any other or unset value disables
+// it.  Unparseable values are treated as disabled.
+func loadEmptyCompleteDebug() {
+	if v, ok := os.LookupEnv("HD_DRIVER_DEBUG_EMPTY"); ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			emptyCompleteDebugEnabled = b
+		}
+	}
+}
+
+// isDebugEmptyComplete reports whether an agent message is an "empty-complete"
+// message: a complete, non-chunk agent message carrying no content, no
+// thoughts, and no tool calls.  Such a message is exactly the suspect in the
+// empty-agent-response bug.
+func isDebugEmptyComplete(agentMsg agentpkg.Message) bool {
+	return agentMsg.Role == agentpkg.RoleAgent &&
+		agentMsg.IsComplete &&
+		!agentMsg.IsChunk &&
+		strings.TrimSpace(agentMsg.Content) == "" &&
+		strings.TrimSpace(agentMsg.Thoughts) == "" &&
+		len(agentMsg.ToolCalls) == 0
+}
+
+// logDebugEmptyComplete emits a diagnostic log entry describing an
+// empty-complete agent message that is about to be sent.  It includes the raw
+// agent message, the raw model completion body, and related context.  This is
+// purely read-only: it never drops, alters, or re-routes the message.
+func logDebugEmptyComplete(sessionID string, agentMsg agentpkg.Message, msg *openai.ChatCompletion, origin string) {
+	agentJSON, err := json.Marshal(agentMsg)
+	if err != nil {
+		agentJSON = []byte(fmt.Sprintf(`{"marshal_error":%q}`, err.Error()))
+	}
+
+	choiceIndex, finishReason := int64(0), ""
+	if len(msg.Choices) > 0 {
+		choiceIndex = msg.Choices[0].Index
+		finishReason = msg.Choices[0].FinishReason
+	}
+
+	dipper.Logger.Errorf(
+		"[openai] DEBUG empty-complete agent message detected "+
+			"session_id=%s origin=%s agent_msg=%s choices=%d choice_index=%d "+
+			"finish_reason=%s content_len=%d thoughts_len=%d tool_calls=%d "+
+			"input_tokens=%d output_tokens=%d raw_body=%s labels=%v",
+		sessionID, origin, string(agentJSON), len(msg.Choices), choiceIndex, finishReason,
+		len(agentMsg.Content), len(agentMsg.Thoughts), len(agentMsg.ToolCalls),
+		msg.Usage.PromptTokens, msg.Usage.CompletionTokens,
+		msg.RawJSON(),
+		agentbusMessage(sessionID, agentMsg).Labels,
+	)
+}
+
 // handleIncomingMessage processes a single OpenAI message from the streaming endpoint,
 // sending appropriate agent messages for content, tool calls, and reasoning texts.
-func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoningExtraction string) {
+// The origin parameter identifies the calling path ("non-streaming" or "streaming")
+// for diagnostic purposes.
+func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoningExtraction string, origin string) {
 	choice := msg.Choices[0]
 	cm := choice.Message
 
@@ -660,6 +728,12 @@ func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoni
 
 	agentMsg.InputTokens = int(msg.Usage.PromptTokens)
 	agentMsg.OutputTokens = int(msg.Usage.CompletionTokens)
+
+	// Diagnostic overlay: log (but never alter) an empty-complete message before
+	// it is sent.  Read-only check — normal behavior is unchanged.
+	if emptyCompleteDebugEnabled && isDebugEmptyComplete(agentMsg) {
+		logDebugEmptyComplete(sessionID, agentMsg, msg, origin)
+	}
 
 	driver.SendMessage(agentbusMessage(sessionID, agentMsg))
 }

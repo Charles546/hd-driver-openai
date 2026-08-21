@@ -136,6 +136,29 @@ message:
         query: golang testing
 ```
 
+## Diagnostics
+
+### Empty-complete message debug logging
+
+The driver can log a diagnostic whenever an **empty-complete** agent message is
+about to be sent — a final agent message (`IsComplete=true`) that carries no
+content, no thoughts, and no tool calls. This is a pure diagnostic overlay: it
+only logs and never drops, alters, or re-routes messages, and it does not
+change the driver behavior for normal messages.
+
+Enable it by setting the `HD_DRIVER_DEBUG_EMPTY` environment variable to `1` or
+`true` when starting the driver:
+
+```bash
+HD_DRIVER_DEBUG_EMPTY=1 hd-driver-openai openai
+```
+
+When enabled, the driver logs a message with the
+`[openai] DEBUG empty-complete agent message detected` prefix, including the
+session id, call origin (`non-streaming` or `streaming`), the full raw agent
+message, the raw model completion body, choice/finish info, token usage, and
+the outbound message labels.
+
 ## License
 
 This project is dual-licensed. By default it is licensed under the GNU Affero General Public License v3.0. If you have a separate written commercial agreement, you may use it under those terms instead.
