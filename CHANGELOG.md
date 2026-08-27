@@ -1,3 +1,10 @@
+## [1.7.1](https://github.com/Charles546/hd-driver-openai/compare/v1.7.0...v1.7.1) (2026-08-27)
+
+
+### Bug Fixes
+
+* deliver tool calls regardless of finish_reason; escalate malformed tool call args ([#22](https://github.com/Charles546/hd-driver-openai/issues/22)) ([7bc1c03](https://github.com/Charles546/hd-driver-openai/commit/7bc1c0347b50bfe593928dbd54161d7dfad55981))
+
 # [1.7.0](https://github.com/Charles546/hd-driver-openai/compare/v1.6.3...v1.7.0) (2026-08-21)
 
 
