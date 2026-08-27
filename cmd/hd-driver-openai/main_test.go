@@ -737,7 +737,8 @@ func TestBuildToolCalls_Single(t *testing.T) {
 			},
 		},
 	}
-	calls := buildToolCalls(toolCalls)
+	calls, err := buildToolCalls(toolCalls)
+	require.NoError(t, err)
 	require.Len(t, calls, 1)
 	assert.Equal(t, "do_thing", calls[0].FuncName)
 	assert.Equal(t, float64(1), calls[0].Params["x"])
@@ -748,7 +749,8 @@ func TestBuildToolCalls_Multiple(t *testing.T) {
 		{Function: openai.ChatCompletionMessageFunctionToolCallFunction{Name: "a", Arguments: `{"k":"v1"}`}},
 		{Function: openai.ChatCompletionMessageFunctionToolCallFunction{Name: "b", Arguments: `{"k":"v2"}`}},
 	}
-	calls := buildToolCalls(toolCalls)
+	calls, err := buildToolCalls(toolCalls)
+	require.NoError(t, err)
 	require.Len(t, calls, 2)
 	assert.Equal(t, "a", calls[0].FuncName)
 	assert.Equal(t, "b", calls[1].FuncName)
@@ -758,10 +760,35 @@ func TestBuildToolCalls_InvalidJSON(t *testing.T) {
 	toolCalls := []openai.ChatCompletionMessageToolCallUnion{
 		{Function: openai.ChatCompletionMessageFunctionToolCallFunction{Name: "fn", Arguments: `not-json`}},
 	}
-	calls := buildToolCalls(toolCalls)
+	calls, err := buildToolCalls(toolCalls)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "malformed tool call arguments")
+	assert.Contains(t, err.Error(), "fn")
+	assert.Nil(t, calls)
+}
+
+func TestBuildToolCalls_ValidEmptyArgs(t *testing.T) {
+	toolCalls := []openai.ChatCompletionMessageToolCallUnion{
+		{Function: openai.ChatCompletionMessageFunctionToolCallFunction{Name: "fn", Arguments: `{}`}},
+	}
+	calls, err := buildToolCalls(toolCalls)
+	require.NoError(t, err)
 	require.Len(t, calls, 1)
 	assert.Equal(t, "fn", calls[0].FuncName)
-	assert.Nil(t, calls[0].Params)
+	assert.NotNil(t, calls[0].Params)
+	assert.Empty(t, calls[0].Params)
+}
+
+func TestBuildToolCalls_TruncatedArgs(t *testing.T) {
+	// Simulates a tool call whose argument JSON was truncated mid-parse (e.g.
+	// finish_reason="length" cutting off the response).  Must be treated as an
+	// error rather than emitting a broken empty-params tool call.
+	toolCalls := []openai.ChatCompletionMessageToolCallUnion{
+		{Function: openai.ChatCompletionMessageFunctionToolCallFunction{Name: "fn", Arguments: `{"query": "go`}},
+	}
+	calls, err := buildToolCalls(toolCalls)
+	require.Error(t, err)
+	assert.Nil(t, calls)
 }
 
 // ─── sendToModel integration ──────────────────────────────────────────────────
@@ -823,6 +850,29 @@ func openAIToolCallBody(toolName, argsJSON string) map[string]interface{} {
 				"finish_reason": "tool_calls",
 			},
 		},
+	}
+}
+
+// openAIToolCallBodyFinish returns a mock HTTP 200 response body with a single
+// tool call and an explicit finish_reason.  It mirrors openAIToolCallBody but
+// allows controlling the finish_reason (e.g. "length") to exercise the bug fix.
+func openAIToolCallBodyFinish(toolName, argsJSON, finishReason string) map[string]interface{} {
+	return map[string]interface{}{
+		"id": "chatcmpl-test", "object": "chat.completion", "created": 1234567890, "model": "gpt-4o",
+		"choices": []map[string]interface{}{
+			{
+				"index": 0,
+				"message": map[string]interface{}{
+					"role":    "assistant",
+					"content": nil,
+					"tool_calls": []map[string]interface{}{
+						{"id": "call_abc", "type": "function", "function": map[string]interface{}{"name": toolName, "arguments": argsJSON}},
+					},
+				},
+				"finish_reason": finishReason,
+			},
+		},
+		"usage": map[string]interface{}{"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
 	}
 }
 
@@ -929,6 +979,155 @@ func TestSendToModel_ToolCallResponse(t *testing.T) {
 	require.Len(t, rawCalls, 1)
 	call := rawCalls[0].(map[string]interface{})
 	assert.Equal(t, "search_web", call["FuncName"])
+}
+
+// TestSendToModel_ToolCallLengthFinishPopulates verifies the core bug fix: a
+// non-streaming response with finish_reason="length" that still carries a valid
+// tool call must populate agentMsg.ToolCalls instead of being dropped into an
+// empty-complete message.
+func TestSendToModel_ToolCallLengthFinishPopulates(t *testing.T) {
+	ts := mockOpenAIServer(openAIToolCallBodyFinish("search_web", `{"query":"golang testing"}`, "length"))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, nil)
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	sendToModel(testMessage("test-engine"))
+
+	result := <-done
+	require.NotNil(t, result)
+
+	payloadMap, ok := result.Payload.(map[string]interface{})
+	require.True(t, ok)
+	msgMap, ok := payloadMap["message"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, agentpkg.RoleAgent, msgMap["Role"])
+	assert.True(t, msgMap["is_complete"].(bool))
+
+	rawCalls, ok := msgMap["ToolCalls"].([]interface{})
+	require.True(t, ok, "tool calls must be populated even with finish_reason=length")
+	require.Len(t, rawCalls, 1)
+	call := rawCalls[0].(map[string]interface{})
+	assert.Equal(t, "search_web", call["FuncName"])
+}
+
+// TestSendToModel_ToolCallValidEmptyArgs verifies that a valid tool call with
+// empty arguments "{}" is populated normally (not treated as the bug).
+func TestSendToModel_ToolCallValidEmptyArgs(t *testing.T) {
+	ts := mockOpenAIServer(openAIToolCallBodyFinish("no_args", `{}`, "tool_calls"))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, nil)
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	sendToModel(testMessage("test-engine"))
+
+	result := <-done
+	require.NotNil(t, result)
+
+	payloadMap, ok := result.Payload.(map[string]interface{})
+	require.True(t, ok)
+	msgMap, ok := payloadMap["message"].(map[string]interface{})
+	require.True(t, ok)
+	assert.True(t, msgMap["is_complete"].(bool))
+
+	rawCalls, ok := msgMap["ToolCalls"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, rawCalls, 1)
+	call := rawCalls[0].(map[string]interface{})
+	assert.Equal(t, "no_args", call["FuncName"])
+}
+
+// TestSendToModel_ToolCallTruncatedArgsRetriesThenSucceeds verifies that a
+// response whose tool call arguments are malformed/truncated (invalid JSON) is
+// escalated as retryable and retried, rather than emitting an empty-params tool
+// call or an empty-complete message.
+func TestSendToModel_ToolCallTruncatedArgsRetriesThenSucceeds(t *testing.T) {
+	var callCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(callCount.Add(1))
+		w.Header().Set("Content-Type", "application/json")
+
+		if n == 1 {
+			// First call: truncated/malformed arguments with finish_reason=length.
+			_ = json.NewEncoder(w).Encode(openAIToolCallBodyFinish("search_web", `{"query": "go`, "length"))
+		} else {
+			// Second call: valid text response.
+			_ = json.NewEncoder(w).Encode(openAITextBody("Success after retry!"))
+		}
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "10ms",
+		"retry_max_delay":     "100ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		payloadMap, ok := result.Payload.(map[string]interface{})
+		require.True(t, ok)
+		msgMap, ok := payloadMap["message"].(map[string]interface{})
+		require.True(t, ok)
+		assert.Equal(t, "Success after retry!", msgMap["content"])
+		assert.True(t, msgMap["is_complete"].(bool))
+		// Should have been called twice (first malformed, then success).
+		assert.Equal(t, int32(2), callCount.Load(), "malformed tool call should be retried")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for success after malformed tool call retry")
+	}
+}
+
+// TestSendToModel_ToolCallTruncatedArgsRetryExhausted verifies that when a
+// malformed tool call argument persists across all retries, an error is sent to
+// the session via the deferred recovery rather than an empty-complete message.
+func TestSendToModel_ToolCallTruncatedArgsRetryExhausted(t *testing.T) {
+	var callCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openAIToolCallBodyFinish("search_web", `{"query": "go`, "length"))
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "agentbus", result.Channel)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "retry exhausted")
+		assert.Equal(t, int32(3), callCount.Load(), "should have attempted 3 times")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error after malformed tool call retry exhaustion")
+	}
 }
 
 func TestSendToModel_UnknownEngine(t *testing.T) {
@@ -1496,6 +1695,128 @@ func TestSendToModel_StreamingToolCallResponse(t *testing.T) {
 
 	call := rawCalls[0].(map[string]interface{})
 	assert.Equal(t, "search_web", call["FuncName"])
+}
+
+// TestSendToModel_StreamingToolCallLengthFinishPopulates verifies that the
+// streaming path also populates tool calls when the stream finishes with
+// finish_reason="length" (the bug fix must apply to both non-streaming and
+// streaming paths since both funnel through handleIncomingMessage).
+func TestSendToModel_StreamingToolCallLengthFinishPopulates(t *testing.T) {
+	chunks := []map[string]interface{}{
+		streamingToolCallChunk("call_xyz", "search_web", `{"query":"go testing"}`, ""),
+		streamingToolCallChunk("", "", "", "length"),
+	}
+	ts := mockSSEServer(chunks)
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, nil)
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	sendToModel(streamingMessage())
+
+	result := <-done
+	require.NotNil(t, result)
+
+	payloadMap, ok := result.Payload.(map[string]interface{})
+	require.True(t, ok)
+	msgMap, ok := payloadMap["message"].(map[string]interface{})
+	require.True(t, ok)
+
+	assert.Equal(t, agentpkg.RoleAgent, msgMap["Role"])
+	assert.True(t, msgMap["is_complete"].(bool))
+
+	rawCalls, ok := msgMap["ToolCalls"].([]interface{})
+	require.True(t, ok, "streaming tool calls must be populated even with finish_reason=length")
+	require.Len(t, rawCalls, 1)
+
+	call := rawCalls[0].(map[string]interface{})
+	assert.Equal(t, "search_web", call["FuncName"])
+}
+
+// TestSendToModel_StreamingToolCallTruncatedArgsRetriesThenSucceeds verifies
+// that a streaming response with malformed/truncated tool call arguments is
+// escalated as retryable and retried, rather than emitting an empty-params
+// tool call or an empty-complete message.
+func TestSendToModel_StreamingToolCallTruncatedArgsRetriesThenSucceeds(t *testing.T) {
+	var connectCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(connectCount.Add(1))
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		if n == 1 {
+			// First connection: truncated/malformed arguments with finish_reason=length.
+			chunk1, _ := json.Marshal(streamingToolCallChunk("call_xyz", "search_web", `{"query": "go`, ""))
+			fmt.Fprintf(w, "data: %s\n\n", chunk1)
+			chunk2, _ := json.Marshal(streamingToolCallChunk("", "", "", "length"))
+			fmt.Fprintf(w, "data: %s\n\n", chunk2)
+		} else {
+			// Subsequent connections: successful streaming response.
+			chunk1, _ := json.Marshal(streamingChunk("Hello after retry!", ""))
+			fmt.Fprintf(w, "data: %s\n\n", chunk1)
+			chunk2, _ := json.Marshal(streamingChunk("", "stop"))
+			fmt.Fprintf(w, "data: %s\n\n", chunk2)
+		}
+
+		fmt.Fprint(w, "data: [DONE]\n\n")
+
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  3,
+		"retry_initial_delay": "10ms",
+		"retry_max_delay":     "100ms",
+	})
+	defer outWriter.Close()
+
+	var msgs []*dipper.Message
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for {
+			var m *dipper.Message
+			var panicked bool
+
+			func() {
+				defer func() {
+					if recover() != nil {
+						panicked = true
+					}
+				}()
+
+				m = dipper.FetchMessage(outReader)
+			}()
+
+			if panicked || m == nil {
+				return
+			}
+
+			msgs = append(msgs, m)
+		}
+	}()
+
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+	outWriter.Close()
+	<-done
+
+	require.GreaterOrEqual(t, len(msgs), 1, "expected at least one message after streaming retry")
+	last := msgs[len(msgs)-1]
+	payloadMap := last.Payload.(map[string]interface{})
+	msgMap := payloadMap["message"].(map[string]interface{})
+	assert.True(t, msgMap["is_complete"].(bool))
+	assert.Contains(t, msgMap["content"], "Hello after retry!")
+	assert.Equal(t, int32(2), connectCount.Load(), "malformed streaming tool call should be retried")
 }
 
 // ─── sendToModel streaming API error handling ────────────────────────────────

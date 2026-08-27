@@ -222,8 +222,17 @@ func sendToModel(msg *dipper.Message) {
 				}
 			}
 
-			// Success.
-			handleIncomingMessage(completion, sessionID, reasoningExtraction, "non-streaming")
+			// Success.  A non-nil error means a tool call had malformed/truncated
+			// arguments, which we escalate as retryable (same as the empty-response
+			// handling) rather than emitting a broken empty-params tool call.
+			if err := handleIncomingMessage(completion, sessionID, reasoningExtraction, "non-streaming"); err != nil {
+				dipper.Logger.Warningf("[openai] malformed tool call arguments session=%s err=%v raw=%s",
+					sessionID, err, completion.RawJSON())
+
+				return true, &retryAfterError{
+					Err: errors.Join(fmt.Errorf("%w: malformed tool call arguments", errRetryable), err),
+				}
+			}
 
 			return false, nil
 		}
@@ -619,12 +628,36 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 
 		// Content was already delivered before final empty response.
 		// Still send the complete message to avoid hanging the session.
-		handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction, "streaming")
+		if err := handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction, "streaming"); err != nil {
+			dipper.Logger.Warningf("[openai] streaming malformed tool call arguments session=%s err=%v raw=%s",
+				sessionID, err, acc.RawJSON())
+
+			// Content already delivered; escalate as an error without retrying.
+			return delivered, &apiErrorInfo{
+				Code:      "malformed_tool_call",
+				Message:   err.Error(),
+				Type:      "malformed_tool_call",
+				Retryable: false,
+			}
+		}
 
 		return delivered, nil
 	}
 
-	handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction, "streaming")
+	if err := handleIncomingMessage(&acc.ChatCompletion, sessionID, reasoningExtraction, "streaming"); err != nil {
+		// Malformed/truncated tool call arguments in the accumulated completion.
+		// Escalate as retryable (consistent with empty_response handling) when no
+		// content has been delivered yet; otherwise surface as an error.
+		dipper.Logger.Warningf("[openai] streaming malformed tool call arguments session=%s err=%v delivered=%v raw=%s",
+			sessionID, err, delivered, acc.RawJSON())
+
+		return delivered, &apiErrorInfo{
+			Code:      "malformed_tool_call",
+			Message:   err.Error(),
+			Type:      "malformed_tool_call",
+			Retryable: !delivered,
+		}
+	}
 
 	return delivered, nil
 }
@@ -703,7 +736,15 @@ func logDebugEmptyComplete(sessionID string, agentMsg agentpkg.Message, msg *ope
 // sending appropriate agent messages for content, tool calls, and reasoning texts.
 // The origin parameter identifies the calling path ("non-streaming" or "streaming")
 // for diagnostic purposes.
-func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoningExtraction string, origin string) {
+//
+// Tool calls are populated whenever they are present in the model response,
+// regardless of finish_reason.  Previously the population was gated on
+// finish_reason == "tool_calls", which caused valid tool calls in a response
+// that finished with finish_reason="length" (output token limit) to be dropped,
+// leaving an empty-complete message.  If the tool call's function arguments are
+// malformed/truncated (not valid JSON), an error is returned so the caller can
+// escalate as retryable rather than emit a broken tool call.
+func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoningExtraction string, origin string) error {
 	choice := msg.Choices[0]
 	cm := choice.Message
 
@@ -722,8 +763,12 @@ func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoni
 		}
 	}
 
-	if choice.FinishReason == "tool_calls" && len(cm.ToolCalls) > 0 {
-		agentMsg.ToolCalls = buildToolCalls(cm.ToolCalls)
+	if len(cm.ToolCalls) > 0 {
+		var err error
+		agentMsg.ToolCalls, err = buildToolCalls(cm.ToolCalls)
+		if err != nil {
+			return err
+		}
 	}
 
 	agentMsg.InputTokens = int(msg.Usage.PromptTokens)
@@ -736,6 +781,8 @@ func handleIncomingMessage(msg *openai.ChatCompletion, sessionID string, reasoni
 	}
 
 	driver.SendMessage(agentbusMessage(sessionID, agentMsg))
+
+	return nil
 }
 
 // newOpenAIClient creates an OpenAI client from the per-engine configuration.
@@ -909,14 +956,22 @@ func buildTools(tools map[string]agentpkg.Tool) []openai.ChatCompletionToolUnion
 
 // buildToolCalls converts OpenAI tool-call response entries into the
 // agent package ToolCall format consumed by the agent session.
-func buildToolCalls(toolCalls []openai.ChatCompletionMessageToolCallUnion) []agentpkg.ToolCall {
+//
+// An error is returned when a tool call's function arguments are not valid
+// JSON.  This happens when the model response was truncated mid-argument
+// (e.g. finish_reason="length" cutting off a tool call).  Rather than
+// emitting an empty/nil-params tool call, the caller escalates the malformed
+// response as retryable.
+func buildToolCalls(toolCalls []openai.ChatCompletionMessageToolCallUnion) ([]agentpkg.ToolCall, error) {
 	calls := make([]agentpkg.ToolCall, 0, len(toolCalls))
 
 	for _, tc := range toolCalls {
 		fn := tc.Function
 
 		var params map[string]interface{}
-		_ = json.Unmarshal([]byte(fn.Arguments), &params)
+		if err := json.Unmarshal([]byte(fn.Arguments), &params); err != nil {
+			return nil, fmt.Errorf("malformed tool call arguments for function %q: %w", fn.Name, err)
+		}
 
 		calls = append(calls, agentpkg.ToolCall{
 			FuncName: fn.Name,
@@ -924,7 +979,7 @@ func buildToolCalls(toolCalls []openai.ChatCompletionMessageToolCallUnion) []age
 		})
 	}
 
-	return calls
+	return calls, nil
 }
 
 // parseDuration parses a Go duration string (e.g. "1s", "500ms") or returns the
