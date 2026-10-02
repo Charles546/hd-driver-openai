@@ -10,6 +10,7 @@ This driver enables Honeydipper's agent service to call OpenAI-compatible chat c
 - **Per-request overrides**: pass extra model parameters (e.g. `temperature`, `max_tokens`) via `model_data`
 - **Custom HTTP headers**: send arbitrary headers per engine (useful for provider-specific auth, tracing, or routing)
 - **Interruptible RPC**: honours driver shutdown and context cancellation
+- **Bounded retries**: retries transient empty responses, but surfaces output-token-limit responses immediately because repeating an unchanged request cannot recover them
 
 ## Installation
 

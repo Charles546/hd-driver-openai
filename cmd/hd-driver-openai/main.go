@@ -213,12 +213,21 @@ func sendToModel(msg *dipper.Message) {
 
 			// Check for empty response (stop/length with no content and no tool calls).
 			if isResponseEmpty(completion) {
+				finishReason := completion.Choices[0].FinishReason
 				dipper.Logger.Warningf("[openai] empty response session=%s finish_reason=%s raw=%s",
-					sessionID, completion.Choices[0].FinishReason, completion.RawJSON())
+					sessionID, finishReason, completion.RawJSON())
+
+				// A length-limited response is deterministic for an unchanged
+				// request. Retrying it consumes the same output budget again and
+				// delays the actionable error delivered to the agent session.
+				if finishReason == "length" {
+					return false, fmt.Errorf("%w: empty response reached output token limit (finish_reason=%s)",
+						errNonRetryable, finishReason)
+				}
 
 				return true, &retryAfterError{
 					Err: fmt.Errorf("%w: empty response (finish_reason=%s)",
-						errRetryable, completion.Choices[0].FinishReason),
+						errRetryable, finishReason),
 				}
 			}
 
@@ -615,14 +624,21 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 	// Check for empty response (stop/length with no content and no tool calls).
 	if isResponseEmpty(&acc.ChatCompletion) {
 		if !delivered {
+			finishReason := acc.Choices[0].FinishReason
 			dipper.Logger.Warningf("[openai] streaming empty response session=%s finish_reason=%s raw=%s",
-				sessionID, acc.Choices[0].FinishReason, acc.RawJSON())
+				sessionID, finishReason, acc.RawJSON())
+
+			retryable := finishReason != "length"
+			message := "model returned complete response with no content"
+			if !retryable {
+				message = "model reached output token limit without usable content"
+			}
 
 			return delivered, &apiErrorInfo{
 				Code:      "empty_response",
-				Message:   "model returned complete response with no content",
+				Message:   message,
 				Type:      "empty_response",
-				Retryable: true,
+				Retryable: retryable,
 			}
 		}
 

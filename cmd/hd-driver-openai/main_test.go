@@ -2530,6 +2530,51 @@ func openAIEmptyResponseBody() map[string]interface{} {
 	}
 }
 
+func openAIEmptyLengthResponseBody() map[string]interface{} {
+	return map[string]interface{}{
+		"id": "chatcmpl-empty-length", "object": "chat.completion", "created": 1234567890, "model": "gpt-4o",
+		"choices": []map[string]interface{}{
+			{"index": 0, "message": map[string]interface{}{"role": "assistant", "content": ""}, "finish_reason": "length"},
+		},
+		"usage": map[string]interface{}{"prompt_tokens": 10, "completion_tokens": 4096, "total_tokens": 4106},
+	}
+}
+
+func TestSendToModel_EmptyLengthResponseIsNotRetried(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	var callCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openAIEmptyLengthResponseBody())
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  10,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "output token limit")
+		assert.Equal(t, int32(1), callCount.Load(), "length-limited empty response must not be retried")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for length-limit error message")
+	}
+}
+
 func TestSendToModel_EmptyResponseRetryThenSucceed(t *testing.T) {
 	// Note: NOT t.Parallel() because tests share the global driver variable.
 
@@ -2624,6 +2669,54 @@ func TestSendToModel_EmptyResponseRetryExhausted(t *testing.T) {
 func streamingEmptyResponseChunks() []map[string]interface{} {
 	return []map[string]interface{}{
 		streamingChunk("", "stop"),
+	}
+}
+
+func streamingEmptyLengthResponseChunks() []map[string]interface{} {
+	return []map[string]interface{}{
+		streamingChunk("", "length"),
+	}
+}
+
+func TestSendToModel_StreamingEmptyLengthResponseIsNotRetried(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	var connectCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connectCount.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		for _, chunk := range streamingEmptyLengthResponseChunks() {
+			b, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  10,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "output token limit")
+		assert.Equal(t, int32(1), connectCount.Load(), "length-limited empty stream must not be retried")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for streaming length-limit error message")
 	}
 }
 
