@@ -1,3 +1,10 @@
+## [1.7.2](https://github.com/Charles546/hd-driver-openai/compare/v1.7.1...v1.7.2) (2026-10-19)
+
+
+### Bug Fixes
+
+* stop retrying empty length-limited responses ([#23](https://github.com/Charles546/hd-driver-openai/issues/23)) ([5940ca4](https://github.com/Charles546/hd-driver-openai/commit/5940ca45863709fe7b17d21d02f36d525f131824))
+
 ## [1.7.1](https://github.com/Charles546/hd-driver-openai/compare/v1.7.0...v1.7.1) (2026-08-27)
 
 
