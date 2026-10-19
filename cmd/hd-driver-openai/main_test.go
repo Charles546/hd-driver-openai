@@ -1056,8 +1056,8 @@ func TestSendToModel_ToolCallTruncatedArgsRetriesThenSucceeds(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 
 		if n == 1 {
-			// First call: truncated/malformed arguments with finish_reason=length.
-			_ = json.NewEncoder(w).Encode(openAIToolCallBodyFinish("search_web", `{"query": "go`, "length"))
+			// First call: malformed arguments with finish_reason=tool_calls.
+			_ = json.NewEncoder(w).Encode(openAIToolCallBodyFinish("search_web", `{"query": "go`, "tool_calls"))
 		} else {
 			// Second call: valid text response.
 			_ = json.NewEncoder(w).Encode(openAITextBody("Success after retry!"))
@@ -1102,7 +1102,7 @@ func TestSendToModel_ToolCallTruncatedArgsRetryExhausted(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(openAIToolCallBodyFinish("search_web", `{"query": "go`, "length"))
+		_ = json.NewEncoder(w).Encode(openAIToolCallBodyFinish("search_web", `{"query": "go`, "tool_calls"))
 	}))
 	defer ts.Close()
 
@@ -1127,6 +1127,43 @@ func TestSendToModel_ToolCallTruncatedArgsRetryExhausted(t *testing.T) {
 		assert.Equal(t, int32(3), callCount.Load(), "should have attempted 3 times")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for error after malformed tool call retry exhaustion")
+	}
+}
+
+// TestSendToModel_ToolCallTruncatedArgsLengthIsNotRetried verifies that tool
+// call arguments truncated by the output token limit (finish_reason=length)
+// fail fast with a length_limit error instead of being retried.
+func TestSendToModel_ToolCallTruncatedArgsLengthIsNotRetried(t *testing.T) {
+	var callCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(openAIToolCallBodyFinish("search_web", `{"query": "go`, "length"))
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  10,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(testMessage("test-engine")) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "length_limit")
+		assert.Contains(t, result.Labels["reason"], "malformed tool call arguments")
+		assert.Equal(t, int32(1), callCount.Load(), "length-truncated tool call must not be retried")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for length-limit error message")
 	}
 }
 
@@ -1750,10 +1787,10 @@ func TestSendToModel_StreamingToolCallTruncatedArgsRetriesThenSucceeds(t *testin
 		w.Header().Set("Connection", "keep-alive")
 
 		if n == 1 {
-			// First connection: truncated/malformed arguments with finish_reason=length.
+			// First connection: malformed arguments with finish_reason=tool_calls.
 			chunk1, _ := json.Marshal(streamingToolCallChunk("call_xyz", "search_web", `{"query": "go`, ""))
 			fmt.Fprintf(w, "data: %s\n\n", chunk1)
-			chunk2, _ := json.Marshal(streamingToolCallChunk("", "", "", "length"))
+			chunk2, _ := json.Marshal(streamingToolCallChunk("", "", "", "tool_calls"))
 			fmt.Fprintf(w, "data: %s\n\n", chunk2)
 		} else {
 			// Subsequent connections: successful streaming response.
@@ -1817,6 +1854,51 @@ func TestSendToModel_StreamingToolCallTruncatedArgsRetriesThenSucceeds(t *testin
 	assert.True(t, msgMap["is_complete"].(bool))
 	assert.Contains(t, msgMap["content"], "Hello after retry!")
 	assert.Equal(t, int32(2), connectCount.Load(), "malformed streaming tool call should be retried")
+}
+
+// TestSendToModel_StreamingToolCallTruncatedArgsLengthIsNotRetried verifies
+// that streamed tool call arguments truncated by the output token limit
+// (finish_reason=length) fail fast with a length_limit error instead of being
+// retried.
+func TestSendToModel_StreamingToolCallTruncatedArgsLengthIsNotRetried(t *testing.T) {
+	var connectCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connectCount.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		chunk1, _ := json.Marshal(streamingToolCallChunk("call_xyz", "search_web", `{"query": "go`, ""))
+		fmt.Fprintf(w, "data: %s\n\n", chunk1)
+		chunk2, _ := json.Marshal(streamingToolCallChunk("", "", "", "length"))
+		fmt.Fprintf(w, "data: %s\n\n", chunk2)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  10,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	done := make(chan *dipper.Message, 1)
+	go func() { done <- dipper.FetchMessage(outReader) }()
+
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+
+	select {
+	case result := <-done:
+		require.NotNil(t, result)
+		assert.Equal(t, "error", result.Labels["status"])
+		assert.Contains(t, result.Labels["reason"], "length_limit")
+		assert.Contains(t, result.Labels["reason"], "malformed tool call arguments")
+		assert.Equal(t, int32(1), connectCount.Load(), "length-truncated streaming tool call must not be retried")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for streaming length-limit error message")
+	}
 }
 
 // ─── sendToModel streaming API error handling ────────────────────────────────
@@ -2569,6 +2651,7 @@ func TestSendToModel_EmptyLengthResponseIsNotRetried(t *testing.T) {
 		require.NotNil(t, result)
 		assert.Equal(t, "error", result.Labels["status"])
 		assert.Contains(t, result.Labels["reason"], "output token limit")
+		assert.Contains(t, result.Labels["reason"], "length_limit")
 		assert.Equal(t, int32(1), callCount.Load(), "length-limited empty response must not be retried")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for length-limit error message")
@@ -2714,10 +2797,91 @@ func TestSendToModel_StreamingEmptyLengthResponseIsNotRetried(t *testing.T) {
 		require.NotNil(t, result)
 		assert.Equal(t, "error", result.Labels["status"])
 		assert.Contains(t, result.Labels["reason"], "output token limit")
+		assert.Contains(t, result.Labels["reason"], "length_limit")
 		assert.Equal(t, int32(1), connectCount.Load(), "length-limited empty stream must not be retried")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for streaming length-limit error message")
 	}
+}
+
+// TestSendToModel_StreamingPartialContentThenLength verifies that content
+// streamed before a final finish_reason=length chunk is delivered (truncated,
+// but usable) rather than reported as a length_limit error or retried.  The
+// final message carries the accumulated content with is_complete=false, since
+// only stop/tool_calls finish reasons mark a message complete.
+func TestSendToModel_StreamingPartialContentThenLength(t *testing.T) {
+	// Note: NOT t.Parallel() because tests share the global driver variable.
+
+	var connectCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connectCount.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		for _, chunk := range []map[string]interface{}{
+			streamingChunk("Partial ", ""),
+			streamingChunk("answer", ""),
+			streamingChunk("", "length"),
+		} {
+			b, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", b)
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer ts.Close()
+
+	outReader, outWriter := setupStreamingDriverWithServer(ts, map[string]interface{}{
+		"retry_max_attempts":  10,
+		"retry_initial_delay": "1ms",
+		"retry_max_delay":     "5ms",
+	})
+	defer outWriter.Close()
+
+	var msgs []*dipper.Message
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for {
+			var m *dipper.Message
+			var panicked bool
+
+			func() {
+				defer func() {
+					if recover() != nil {
+						panicked = true
+					}
+				}()
+
+				m = dipper.FetchMessage(outReader)
+			}()
+
+			if panicked || m == nil {
+				return
+			}
+
+			msgs = append(msgs, m)
+		}
+	}()
+
+	assert.NotPanics(t, func() { sendToModel(streamingMessage()) })
+	outWriter.Close()
+	<-done
+
+	require.GreaterOrEqual(t, len(msgs), 1, "expected streamed messages")
+	for _, m := range msgs {
+		assert.NotEqual(t, "error", m.Labels["status"], "partial content must not produce an error")
+	}
+	last := msgs[len(msgs)-1]
+	payloadMap := last.Payload.(map[string]interface{})
+	msgMap := payloadMap["message"].(map[string]interface{})
+	assert.False(t, msgMap["is_chunk"].(bool))
+	assert.False(t, msgMap["is_complete"].(bool))
+	assert.Equal(t, "Partial answer", msgMap["content"])
+	assert.Equal(t, int32(1), connectCount.Load(), "partial content must not be retried")
 }
 
 func TestSendToModel_StreamingEmptyResponseRetryThenSucceed(t *testing.T) {

@@ -74,6 +74,38 @@ var errRetryable = errors.New("retryable API error")
 // errNonRetryable is a static sentinel for non-retryable API errors.
 var errNonRetryable = errors.New("non-retryable API error")
 
+// finishReasonLength is the chat completion finish_reason reported when the
+// model stopped at its output token limit.  openai-go types FinishReason as a
+// plain string for chat completions, so there is no SDK constant to use.
+const finishReasonLength = "length"
+
+// lengthLimitCode is the error code and type reported when the model reached
+// its output token limit without producing a usable response.
+const lengthLimitCode = "length_limit"
+
+// lengthLimitErrorInfo builds the non-retryable error reported when the model
+// reached its output token limit without producing a usable response.  The
+// driver fails fast instead of retrying: an unchanged request is likely to hit
+// the same limit again, and the agent session receiving the error can adapt the
+// request (e.g. a larger max_tokens via model_data), which a blind driver-side
+// retry cannot.
+func lengthLimitErrorInfo(detail string) *apiErrorInfo {
+	return &apiErrorInfo{
+		Code:      lengthLimitCode,
+		Message:   "model reached output token limit (finish_reason=length) " + detail,
+		Type:      lengthLimitCode,
+		Retryable: false,
+	}
+}
+
+// lengthLimitError wraps lengthLimitErrorInfo as a non-retryable error for the
+// non-streaming retry loop, formatted like other non-retryable API errors.
+func lengthLimitError(detail string) error {
+	info := lengthLimitErrorInfo(detail)
+
+	return fmt.Errorf("%w: code=%s type=%s message=%s", errNonRetryable, info.Code, info.Type, info.Message)
+}
+
 // retryAfterError wraps a retryable error with an optional Retry-After hint.
 type retryAfterError struct {
 	Duration time.Duration
@@ -217,12 +249,9 @@ func sendToModel(msg *dipper.Message) {
 				dipper.Logger.Warningf("[openai] empty response session=%s finish_reason=%s raw=%s",
 					sessionID, finishReason, completion.RawJSON())
 
-				// A length-limited response is deterministic for an unchanged
-				// request. Retrying it consumes the same output budget again and
-				// delays the actionable error delivered to the agent session.
-				if finishReason == "length" {
-					return false, fmt.Errorf("%w: empty response reached output token limit (finish_reason=%s)",
-						errNonRetryable, finishReason)
+				// Fail fast on the output token limit; see lengthLimitErrorInfo.
+				if finishReason == finishReasonLength {
+					return false, lengthLimitError("without usable content")
 				}
 
 				return true, &retryAfterError{
@@ -234,9 +263,14 @@ func sendToModel(msg *dipper.Message) {
 			// Success.  A non-nil error means a tool call had malformed/truncated
 			// arguments, which we escalate as retryable (same as the empty-response
 			// handling) rather than emitting a broken empty-params tool call.
+			// Arguments truncated by the output token limit fail fast instead.
 			if err := handleIncomingMessage(completion, sessionID, reasoningExtraction, "non-streaming"); err != nil {
 				dipper.Logger.Warningf("[openai] malformed tool call arguments session=%s err=%v raw=%s",
 					sessionID, err, completion.RawJSON())
+
+				if completion.Choices[0].FinishReason == finishReasonLength {
+					return false, lengthLimitError("with malformed tool call arguments: " + err.Error())
+				}
 
 				return true, &retryAfterError{
 					Err: errors.Join(fmt.Errorf("%w: malformed tool call arguments", errRetryable), err),
@@ -628,17 +662,16 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 			dipper.Logger.Warningf("[openai] streaming empty response session=%s finish_reason=%s raw=%s",
 				sessionID, finishReason, acc.RawJSON())
 
-			retryable := finishReason != "length"
-			message := "model returned complete response with no content"
-			if !retryable {
-				message = "model reached output token limit without usable content"
+			// Fail fast on the output token limit; see lengthLimitErrorInfo.
+			if finishReason == finishReasonLength {
+				return delivered, lengthLimitErrorInfo("without usable content")
 			}
 
 			return delivered, &apiErrorInfo{
 				Code:      "empty_response",
-				Message:   message,
+				Message:   "model returned complete response with no content",
 				Type:      "empty_response",
-				Retryable: retryable,
+				Retryable: true,
 			}
 		}
 
@@ -664,8 +697,13 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 		// Malformed/truncated tool call arguments in the accumulated completion.
 		// Escalate as retryable (consistent with empty_response handling) when no
 		// content has been delivered yet; otherwise surface as an error.
+		// Arguments truncated by the output token limit fail fast instead.
 		dipper.Logger.Warningf("[openai] streaming malformed tool call arguments session=%s err=%v delivered=%v raw=%s",
 			sessionID, err, delivered, acc.RawJSON())
+
+		if acc.Choices[0].FinishReason == finishReasonLength {
+			return delivered, lengthLimitErrorInfo("with malformed tool call arguments: " + err.Error())
+		}
 
 		return delivered, &apiErrorInfo{
 			Code:      "malformed_tool_call",
