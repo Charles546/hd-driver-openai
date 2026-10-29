@@ -1,10 +1,11 @@
 module github.com/honeydipper/hd-driver-openai
 
-go 1.25.0
+go 1.27.3
 
 require (
-	github.com/honeydipper/honeydipper/v4 v4.0.0-alpha4.0.20260715052248-dd986d55b78e
+	github.com/honeydipper/honeydipper/v4 v4.0.0-dev.11.0.20261029163450-5f0cd9e24f6c
 	github.com/mitchellh/mapstructure v1.5.0
+	github.com/op/go-logging v0.0.0-20160315200505-970db520ece7
 	github.com/openai/openai-go/v3 v3.50.0
 	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/gjson v1.19.0
@@ -26,7 +27,6 @@ require (
 	github.com/mitchellh/copystructure v1.2.0 // indirect
 	github.com/mitchellh/go-wordwrap v1.0.1 // indirect
 	github.com/mitchellh/reflectwalk v1.0.2 // indirect
-	github.com/op/go-logging v0.0.0-20160315200505-970db520ece7 // indirect
 	github.com/pelletier/go-toml/v2 v2.4.3 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/protocolbuffers/txtpbfmt v0.0.0-20260803135053-1fd8a60d1ffc // indirect
