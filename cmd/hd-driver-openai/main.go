@@ -234,50 +234,7 @@ func sendToModel(msg *dipper.Message) {
 
 		lastErrInfo = extractAPIErrorInfo(completion.RawJSON())
 		if lastErrInfo == nil {
-			// No API-level error detected.  Check for empty choices as a safety net.
-			if len(completion.Choices) == 0 {
-				dipper.Logger.Warningf("[openai] no choices in response session=%s: raw=%s",
-					sessionID, completion.RawJSON())
-
-				// Return as retryable so the retry loop can retry the request.
-				return true, fmt.Errorf("%w: response contains no choices", errRetryable)
-			}
-
-			// Check for empty response (stop/length with no content and no tool calls).
-			if isResponseEmpty(completion) {
-				finishReason := completion.Choices[0].FinishReason
-				dipper.Logger.Warningf("[openai] empty response session=%s finish_reason=%s raw=%s",
-					sessionID, finishReason, completion.RawJSON())
-
-				// Fail fast on the output token limit; see lengthLimitErrorInfo.
-				if finishReason == finishReasonLength {
-					return false, lengthLimitError("without usable content")
-				}
-
-				return true, &retryAfterError{
-					Err: fmt.Errorf("%w: empty response (finish_reason=%s)",
-						errRetryable, finishReason),
-				}
-			}
-
-			// Success.  A non-nil error means a tool call had malformed/truncated
-			// arguments, which we escalate as retryable (same as the empty-response
-			// handling) rather than emitting a broken empty-params tool call.
-			// Arguments truncated by the output token limit fail fast instead.
-			if err := handleIncomingMessage(completion, sessionID, reasoningExtraction, "non-streaming"); err != nil {
-				dipper.Logger.Warningf("[openai] malformed tool call arguments session=%s err=%v raw=%s",
-					sessionID, err, completion.RawJSON())
-
-				if completion.Choices[0].FinishReason == finishReasonLength {
-					return false, lengthLimitError("with malformed tool call arguments: " + err.Error())
-				}
-
-				return true, &retryAfterError{
-					Err: errors.Join(fmt.Errorf("%w: malformed tool call arguments", errRetryable), err),
-				}
-			}
-
-			return false, nil
+			return processCompletion(completion, sessionID, reasoningExtraction)
 		}
 
 		// Log the raw error body at debug level for troubleshooting.
@@ -714,6 +671,54 @@ func runStream(ctx context.Context, client *openai.Client, params openai.ChatCom
 	}
 
 	return delivered, nil
+}
+
+// processCompletion handles a completion without API-level errors and reports whether a failure is retryable.
+func processCompletion(completion *openai.ChatCompletion, sessionID string, reasoningExtraction string) (bool, error) {
+	// No API-level error detected.  Check for empty choices as a safety net.
+	if len(completion.Choices) == 0 {
+		dipper.Logger.Warningf("[openai] no choices in response session=%s: raw=%s",
+			sessionID, completion.RawJSON())
+
+		// Return as retryable so the retry loop can retry the request.
+		return true, fmt.Errorf("%w: response contains no choices", errRetryable)
+	}
+
+	// Check for empty response (stop/length with no content and no tool calls).
+	if isResponseEmpty(completion) {
+		finishReason := completion.Choices[0].FinishReason
+		dipper.Logger.Warningf("[openai] empty response session=%s finish_reason=%s raw=%s",
+			sessionID, finishReason, completion.RawJSON())
+
+		// Fail fast on the output token limit; see lengthLimitErrorInfo.
+		if finishReason == finishReasonLength {
+			return false, lengthLimitError("without usable content")
+		}
+
+		return true, &retryAfterError{
+			Err: fmt.Errorf("%w: empty response (finish_reason=%s)",
+				errRetryable, finishReason),
+		}
+	}
+
+	// Success.  A non-nil error means a tool call had malformed/truncated
+	// arguments, which we escalate as retryable (same as the empty-response
+	// handling) rather than emitting a broken empty-params tool call.
+	// Arguments truncated by the output token limit fail fast instead.
+	if err := handleIncomingMessage(completion, sessionID, reasoningExtraction, "non-streaming"); err != nil {
+		dipper.Logger.Warningf("[openai] malformed tool call arguments session=%s err=%v raw=%s",
+			sessionID, err, completion.RawJSON())
+
+		if completion.Choices[0].FinishReason == finishReasonLength {
+			return false, lengthLimitError("with malformed tool call arguments: " + err.Error())
+		}
+
+		return true, &retryAfterError{
+			Err: errors.Join(fmt.Errorf("%w: malformed tool call arguments", errRetryable), err),
+		}
+	}
+
+	return false, nil
 }
 
 // isResponseEmpty checks whether a ChatCompletion response is effectively
