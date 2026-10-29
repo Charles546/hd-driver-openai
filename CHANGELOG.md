@@ -1,3 +1,10 @@
+## [1.7.3](https://github.com/Charles546/hd-driver-openai/compare/v1.7.2...v1.7.3) (2026-10-29)
+
+
+### Bug Fixes
+
+* bump honeydipper SDK to fix options/start race on reload ([#24](https://github.com/Charles546/hd-driver-openai/issues/24)) ([ce37a68](https://github.com/Charles546/hd-driver-openai/commit/ce37a68f0a2ffe6e43334377c813b3e1e2f3c711))
+
 ## [1.7.2](https://github.com/Charles546/hd-driver-openai/compare/v1.7.1...v1.7.2) (2026-10-19)
 
 
